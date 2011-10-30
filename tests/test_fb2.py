@@ -4,7 +4,7 @@ import os
 from nose.tools import assert_equal, raises
 
 import settings
-from fb2 import FB2MetadataCollector, InvalidFB2
+from fb2_metadata_collector import FB2MetadataCollector, InvalidFB2
 
 
 class FB2MetadataCollectorTestCase(object):

@@ -1,5 +1,5 @@
-from library.book_file_processors import UnsupportedBookFileType
-from library.directory_importer import BookFileImporter
+from book_file_processors import UnsupportedBookFileType
+from directory_importer import BookFileImporter
 
 class FakeBookFileProcessorFactory(object):
     def __init__(self, path):

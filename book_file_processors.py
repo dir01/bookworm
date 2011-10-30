@@ -2,8 +2,8 @@ import os
 from operator import attrgetter
 from zipfile import ZipFile
 
-from fb2 import FB2MetadataCollector
-from library.book import Book
+from fb2_metadata_collector import FB2MetadataCollector
+from book import Book
 
 
 class UnsupportedBookFileType(Exception):

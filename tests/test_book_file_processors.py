@@ -3,7 +3,7 @@ import os
 
 from nose.tools import assert_equal, nottest
 
-from library.book_file_processors import BookFileProcessorFactory
+from book_file_processors import BookFileProcessorFactory
 import settings
 
 

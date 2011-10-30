@@ -1,7 +1,7 @@
 import os
 
-from library.book_file_processors import BookFileProcessorFactory
-from library.book_file_processors import UnsupportedBookFileType
+from book_file_processors import BookFileProcessorFactory
+from book_file_processors import UnsupportedBookFileType
 
 
 class DirectoryImporter(object):

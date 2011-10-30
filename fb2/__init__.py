@@ -1,1 +1,0 @@
-from fb2_metadata_collector import FB2MetadataCollector, InvalidFB2
