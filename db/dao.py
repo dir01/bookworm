@@ -1,4 +1,3 @@
-from sqlalchemy.orm.exc import NoResultFound
 
 from db.base import BaseModel, Session, engine
 from db.models import Author, Book
@@ -16,7 +15,7 @@ class BooksDao(object):
         try:
             self.get_book_by_path(path)
             return True
-        except NoResultFound:
+        except Book.NotFound:
             return False
 
     def get_book_by_path(self, path):
