@@ -23,8 +23,8 @@ class BooksDao(object):
 
     def save_book(self, book_object):
         book_builder = BookBuilder(book_object)
-        author = book_builder.create_author(save=True)
-        book = book_builder.create_book(save=False)
+        author = book_builder.create_author().save()
+        book = book_builder.create_book()
         book.author = author
         book.save()
 
@@ -33,18 +33,12 @@ class BookBuilder(object):
     def __init__(self, book_object):
         self.book_object = book_object
 
-    def create_author(self, save=False):
-        author = Author(
+    def create_author(self):
+        return Author(
             first_name=self.book_object.author_first_name,
             middle_name=self.book_object.author_middle_name,
             last_name=self.book_object.author_last_name,
         )
-        if save:
-            author.save()
-        return author
 
-    def create_book(self, save=False):
-        book = Book(path=self.book_object.path, title=self.book_object.title)
-        if save:
-            book.save()
-        return book
+    def create_book(self):
+        return Book(path=self.book_object.path, title=self.book_object.title)
