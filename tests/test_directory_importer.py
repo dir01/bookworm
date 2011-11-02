@@ -1,5 +1,6 @@
 from book_file_processors import UnsupportedBookFileType
 from directory_importer import BookFileImporter
+from settings import TESTS_DATA_ROOT
 
 class FakeBookFileProcessorFactory(object):
     def __init__(self, path):
@@ -25,7 +26,7 @@ class FakeBookFileProcessor(object):
 
 
 
-class FakeDb(object):
+class FakeDao(object):
     already_imported = None
     book = None
 
@@ -45,13 +46,13 @@ class FakeDb(object):
 
 class TestBookFileImporter(object):
     def setup(self):
-        FakeDb.reset()
+        FakeDao.reset()
         FakeBookFileProcessor.reset()
 
     def get_book_file_importer(self):
-        importer = BookFileImporter(path=None)
+        importer = BookFileImporter(path=TESTS_DATA_ROOT)
         importer.BookFileProcessorFactory = FakeBookFileProcessorFactory
-        importer.db = FakeDb
+        importer.dao = FakeDao
         return importer
 
     def test_file_is_saved_to_db_if_wasnt_earlier_imported(self):
@@ -72,10 +73,10 @@ class TestBookFileImporter(object):
     # GIVEN
 
     def given_file_wasnt_imported(self):
-        FakeDb.already_imported = False
+        FakeDao.already_imported = False
 
     def given_file_already_was_imported(self):
-        FakeDb.already_imported = True
+        FakeDao.already_imported = True
 
     # WHEN
 
@@ -92,7 +93,7 @@ class TestBookFileImporter(object):
     # THEN
 
     def then_book_is_saved_to_db(self):
-        assert FakeDb.book
+        assert FakeDao.book
 
     def then_nothing_is_saved_to_db(self):
-       assert not FakeDb.book
+       assert not FakeDao.book
