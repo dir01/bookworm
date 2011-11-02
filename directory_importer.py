@@ -1,5 +1,7 @@
 import os
 
+from db.dao import BooksDao
+
 from file_importer import BookFileImporter
 
 
@@ -21,4 +23,5 @@ class DirectoryImporter(object):
 
     def get_book_file_importer(self, path):
         book_file_importer = BookFileImporter(path)
+        book_file_importer.dao = BooksDao()
         return book_file_importer
