@@ -22,6 +22,7 @@ class BaseModelCls(object):
 
     def save(self):
         Session().add(self)
+        return self
 
     def delete(self):
         Session().delete(self)
