@@ -9,6 +9,14 @@ Session = scoped_session(sessionmaker(bind=engine))
 
 class BaseModelCls(object):
     @declared_attr
+    def __tablename__(cls):
+        return cls.__name__.lower()
+
+    @declared_attr
+    def id(cls):
+        return sa.Column(sa.Integer, primary_key=True)
+
+    @declared_attr
     def NotFound(cls):
         return NoResultFound
 
