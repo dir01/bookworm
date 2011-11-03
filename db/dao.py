@@ -22,6 +22,7 @@ class BooksDao(object):
         book = book_builder.create_book()
         book.author = author
         book.save()
+        return book
 
 
 class BookBuilder(object):
