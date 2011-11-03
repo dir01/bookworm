@@ -1,15 +1,10 @@
-
-from db.base import BaseModel, Session, engine
+from db.base import Session
 from db.models import Author, Book
 
 
 class BooksDao(object):
     def __init__(self):
-        BaseModel.metadata.create_all(engine)
-
-    @property
-    def session(self):
-        return Session()
+        self.session = Session()
 
     def book_with_path_already_exists(self, path):
         try:

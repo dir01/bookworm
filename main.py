@@ -6,9 +6,15 @@ parser.add_argument(
     help='Directory to import books from'
 )
 
+def setup():
+    from db.base import BaseModel, engine
+    BaseModel.metadata.create_all(engine)
+
 
 def main():
     from directory_importer import DirectoryImporter
+
+    setup()
 
     args = parser.parse_args()
     for path in args.directories:
