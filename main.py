@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-from functools import wraps
 import argparse
-from datetime import datetime
+
 from settings import PROGRAM_NAME
+from utils import print_execution_time
 
 
 def syncdb():
@@ -13,22 +13,7 @@ def syncdb():
     Base.metadata.create_all(session.bind)
 
 
-def print_execution_time_on_finish_or_interrupt(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        begin = datetime.now()
-        try:
-            func(*args, **kwargs)
-        except KeyboardInterrupt:
-            print '\rInterrupted. Worked for %s' % (datetime.now() - begin)
-        except Exception, e:
-            print 'Unhandled error. Worked for %s' % (datetime.now() - begin)
-            raise
-        else:
-            print 'Finished. It took %s' % (datetime.now() - begin)
-    return wrapper
-
-@print_execution_time_on_finish_or_interrupt
+@print_execution_time
 def do_import(args):
     syncdb()
     from directory_importer import DirectoryImporter
