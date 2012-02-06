@@ -46,11 +46,12 @@ class TestRegular(FB2MetadataCollectorTestCase):
         assert_equal('d85aaac3-2a81-102a-9ae1-2dfe723fe7c7', self.collector.get_id())
 
     def test_lang(self):
-        assert_equal('ru', self.collector.get_lang())
+        assert_equal('ru', self.collector.get_language())
 
 
 class TestWrongFile(FB2MetadataCollectorTestCase):
-    def setup(self):
+    @raises(InvalidFB2)
+    def test(self):
         self.collector = self.get_collector(self.get_wrong_book_filename())
 
     def get_wrong_book_filename(self):
@@ -58,7 +59,3 @@ class TestWrongFile(FB2MetadataCollectorTestCase):
             settings.TESTS_DATA_ROOT,
             'dostoevskii_fedor_besy.fb2.zip'
         )
-
-    @raises(InvalidFB2)
-    def test_wrong_file(self):
-        self.collector.get_title()

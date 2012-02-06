@@ -2,7 +2,7 @@ import os
 from operator import attrgetter
 from zipfile import ZipFile
 
-from fb2_metadata_collector import FB2MetadataCollector
+from fb2_metadata_collector import FB2MetadataCollector, InvalidFB2
 from book import Book
 
 
@@ -36,16 +36,26 @@ class BaseBookFileProcessor(object):
     def __init__(self, path):
         self.path = path
 
-    def get_book(self):
-        self.validate_book_file()
-        book_metadata_collector = self.get_book_metadata_collector()
+    def build_book(self, book_metadata_collector):
         return Book(
             path=self.path,
             author_first_name=book_metadata_collector.get_author_first_name(),
             author_middle_name=book_metadata_collector.get_author_middle_name(),
             author_last_name=book_metadata_collector.get_author_last_name(),
             title=book_metadata_collector.get_title(),
+            genre=book_metadata_collector.get_genre(),
+            date=book_metadata_collector.get_date(),
+            language=book_metadata_collector.get_language()
         )
+
+    def get_book(self):
+        try:
+            self.validate_book_file()
+            book_metadata_collector = self.get_book_metadata_collector()
+            return self.build_book(book_metadata_collector)
+        except Exception, e:
+            raise UnsupportedBookFileType()
+
 
     def validate_book_file(self):
         pass

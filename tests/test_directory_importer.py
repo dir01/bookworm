@@ -1,99 +1,85 @@
+from mock import Mock
 from book_file_processors import UnsupportedBookFileType
-from directory_importer import BookFileImporter
+from file_importer import BookFileImporter
 from settings import TESTS_DATA_ROOT
 
 class FakeBookFileProcessorFactory(object):
-    def __init__(self, path):
+    is_valid = None
+
+    def __init__(self, *args, **kwargs):
         pass
 
     def get_book_file_processor(self):
-        return FakeBookFileProcessor()
+        return FakeBookFileProcessor(self.is_valid)
 
 
 class FakeBookFileProcessor(object):
-    file_is_valid = True
-    valid_fake_book = 'Really anything. The guy is dumb'
+    def __init__(self, is_valid):
+        self.is_valid = is_valid
 
     def get_book(self):
-        if self.file_is_valid:
-            return self.valid_fake_book
-        else:
+        if not self.is_valid:
             raise UnsupportedBookFileType
-
-    @classmethod
-    def reset(cls):
-        cls.file_is_valid = True
-
 
 
 class FakeDao(object):
-    already_imported = None
-    book = None
-
-    @classmethod
-    def book_with_path_already_exists(cls, path):
-        return cls.already_imported
-
-    @classmethod
-    def save_book(cls, book):
-        cls.book = book
-
-    @classmethod
-    def reset(cls):
-        cls.already_imported = None
-        cls.book = None
+    def __init__(self, file_was_imported):
+        self.is_book_with_path_already_exists = Mock(return_value=file_was_imported)
+        self.save_book = Mock()
 
 
 class TestBookFileImporter(object):
-    def setup(self):
-        FakeDao.reset()
-        FakeBookFileProcessor.reset()
-
-    def get_book_file_importer(self):
-        importer = BookFileImporter(path=TESTS_DATA_ROOT)
-        importer.BookFileProcessorFactory = FakeBookFileProcessorFactory
-        importer.dao = FakeDao
-        return importer
-
     def test_file_is_saved_to_db_if_wasnt_earlier_imported(self):
         self.given_file_wasnt_imported()
+        self.given_file_is_valid()
         self.when_try_to_import_file()
         self.then_book_is_saved_to_db()
 
     def test_nothing_happens_if_file_already_imported(self):
         self.given_file_already_was_imported()
+        self.given_file_is_valid()
         self.when_try_to_import_file()
         self.then_nothing_is_saved_to_db()
 
     def test_nothing_happens_if_file_type_is_unsupported(self):
         self.given_file_wasnt_imported()
-        self.when_try_to_import_wrong_file()
+        self.given_file_is_NOT_valid()
+        self.when_try_to_import_file()
         self.then_nothing_is_saved_to_db()
 
     # GIVEN
 
     def given_file_wasnt_imported(self):
-        FakeDao.already_imported = False
+        self.file_was_imported = False
 
     def given_file_already_was_imported(self):
-        FakeDao.already_imported = True
+        self.file_was_imported = True
+
+    def given_file_is_valid(self):
+        self.file_is_valid = True
+
+    def given_file_is_NOT_valid(self):
+        self.file_is_valid = False
 
     # WHEN
 
     def when_try_to_import_file(self):
-        self.try_to_import_file()
+        self.importer = self.get_book_file_importer()
+        self.importer.try_to_import_file_if_not_already_imported(TESTS_DATA_ROOT)
 
-    def when_try_to_import_wrong_file(self):
-        FakeBookFileProcessor.file_is_valid = False
-        self.try_to_import_file()
+    def get_book_file_importer(self):
+        importer = BookFileImporter()
+        FakeBookFileProcessorFactory.is_valid = self.file_is_valid
+        importer.book_processor_factory_cls = FakeBookFileProcessorFactory
+        importer.dao = FakeDao(file_was_imported=self.file_was_imported)
+        return importer
 
-    def try_to_import_file(self):
-        self.get_book_file_importer().try_to_import_file_if_not_already_imported()
+
 
     # THEN
 
     def then_book_is_saved_to_db(self):
-        assert FakeDao.book
+        assert self.importer.dao.save_book.called
 
     def then_nothing_is_saved_to_db(self):
-       assert not FakeDao.book
+       assert not self.importer.dao.save_book.called

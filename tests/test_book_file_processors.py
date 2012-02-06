@@ -30,7 +30,9 @@ class TestFB2BookFileProcessor(BookFileProcessorTestCase):
         return os.path.join(settings.TESTS_DATA_ROOT, 'dostoevskii_fedor_besy.fb2')
 
     def test(self):
-        assert_equal(u'Федор Михайлович Достоевский', self.book.get_author_full_name())
+        assert_equal(u'Федор', self.book.author_first_name)
+        assert_equal(u'Михайлович', self.book.author_middle_name)
+        assert_equal(u'Достоевский', self.book.author_last_name)
         assert_equal(u'Бесы', self.book.title)
         assert_equal(self.get_tested_filename(), self.book.path)
 
@@ -41,7 +43,9 @@ class TestZippedFB2BookFileProcessor(BookFileProcessorTestCase):
         return os.path.join(settings.TESTS_DATA_ROOT, 'dostoevskii_fedor_besy.fb2.zip')
 
     def test(self):
-        assert_equal(u'Федор Михайлович Достоевский', self.book.get_author_full_name())
+        assert_equal(u'Федор', self.book.author_first_name)
+        assert_equal(u'Михайлович', self.book.author_middle_name)
+        assert_equal(u'Достоевский', self.book.author_last_name)
         assert_equal(u'Бесы', self.book.title)
         assert_equal(self.get_tested_filename(), self.book.path)
 

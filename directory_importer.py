@@ -1,27 +1,26 @@
+import logging
 import os
 
-from db.dao import BooksDao
-
-from file_importer import BookFileImporter
-
-
 class DirectoryImporter(object):
-    def __init__(self, path):
-        self.path = path
+    file_importer = None
+    logger = None
 
-    def do_import(self):
-        for path in self.get_all_filenames_iter():
-            self.try_to_import_file_if_not_already_imported(path)
+    @classmethod
+    def get_instance(cls):
+        from file_importer import BookFileImporter
+        instance = cls()
+        instance.file_importer = BookFileImporter.get_instance()
+        instance.logger = logging.getLogger('directory_importer')
+        return instance
+
+    def do_import(self, path):
+        for filepath in self.iterate_filepaths_under_path(path):
+            self.try_to_import_file_if_not_already_imported(filepath)
 
     def try_to_import_file_if_not_already_imported(self, path):
-        self.get_book_file_importer(path).try_to_import_file_if_not_already_imported()
+        self.file_importer.try_to_import_file_if_not_already_imported(path)
 
-    def get_all_filenames_iter(self):
-        for path, dirs, files in os.walk(self.path):
+    def iterate_filepaths_under_path(self, dirpath):
+        for path, dirs, files in os.walk(dirpath):
             for file in files:
                 yield os.path.join(path, file)
-
-    def get_book_file_importer(self, path):
-        book_file_importer = BookFileImporter(path)
-        book_file_importer.dao = BooksDao()
-        return book_file_importer
