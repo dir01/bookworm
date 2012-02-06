@@ -1,19 +1,18 @@
 # -*- coding: utf8 -*-
 import os
-
-from nose.tools import assert_equal, raises
+import unittest2
 
 import settings
 from fb2_metadata_collector import FB2MetadataCollector, InvalidFB2
 
 
-class FB2MetadataCollectorTestCase(object):
+class FB2MetadataCollectorTestCase(unittest2.TestCase):
     def get_collector(self, filename):
         return FB2MetadataCollector.create_instance_by_filename(filename)
 
 
 class TestRegular(FB2MetadataCollectorTestCase):
-    def setup(self):
+    def setUp(self):
         self.collector = self.get_collector(
             self.get_correct_book_filename()
         )
@@ -25,34 +24,34 @@ class TestRegular(FB2MetadataCollectorTestCase):
         )
 
     def test_author_first_name(self):
-        assert_equal(u'Федор', self.collector.get_author_first_name())
+        self.assertEqual(u'Федор', self.collector.get_author_first_name())
 
     def test_author(self):
-        assert_equal(u'Михайлович', self.collector.get_author_middle_name())
+        self.assertEqual(u'Михайлович', self.collector.get_author_middle_name())
 
     def test_author(self):
-        assert_equal(u'Достоевский', self.collector.get_author_last_name())
+        self.assertEqual(u'Достоевский', self.collector.get_author_last_name())
 
     def test_title(self):
-        assert_equal(u'Бесы', self.collector.get_title())
+        self.assertEqual(u'Бесы', self.collector.get_title())
 
     def test_genre(self):
-        assert_equal('prose_rus_classic', self.collector.get_genre())
+        self.assertEqual('prose_rus_classic', self.collector.get_genre())
 
     def test_date(self):
-        assert_equal('1871', self.collector.get_date())
+        self.assertEqual('1871', self.collector.get_date())
 
     def test_id(self):
-        assert_equal('d85aaac3-2a81-102a-9ae1-2dfe723fe7c7', self.collector.get_id())
+        self.assertEqual('d85aaac3-2a81-102a-9ae1-2dfe723fe7c7', self.collector.get_id())
 
     def test_lang(self):
-        assert_equal('ru', self.collector.get_language())
+        self.assertEqual('ru', self.collector.get_language())
 
 
 class TestWrongFile(FB2MetadataCollectorTestCase):
-    @raises(InvalidFB2)
     def test(self):
-        self.collector = self.get_collector(self.get_wrong_book_filename())
+        with self.assertRaises(InvalidFB2):
+            self.collector = self.get_collector(self.get_wrong_book_filename())
 
     def get_wrong_book_filename(self):
         return os.path.join(

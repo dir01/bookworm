@@ -1,7 +1,11 @@
+import unittest2
+
 from mock import Mock
+
 from book_file_processors import UnsupportedBookFileType
 from file_importer import BookFileImporter
 from settings import TESTS_DATA_ROOT
+
 
 class FakeBookFileProcessorFactory(object):
     is_valid = None
@@ -28,7 +32,7 @@ class FakeDao(object):
         self.save_book = Mock()
 
 
-class TestBookFileImporter(object):
+class TestBookFileImporter(unittest2.TestCase):
     def test_file_is_saved_to_db_if_wasnt_earlier_imported(self):
         self.given_file_wasnt_imported()
         self.given_file_is_valid()
@@ -79,7 +83,7 @@ class TestBookFileImporter(object):
     # THEN
 
     def then_book_is_saved_to_db(self):
-        assert self.importer.dao.save_book.called
+        self.assertTrue(self.importer.dao.save_book.called)
 
     def then_nothing_is_saved_to_db(self):
-       assert not self.importer.dao.save_book.called
+       self.assertFalse(self.importer.dao.save_book.called)

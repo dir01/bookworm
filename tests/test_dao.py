@@ -1,8 +1,4 @@
 import unittest2
-from mock import patch
-from sqlalchemy.engine import create_engine
-from sqlalchemy.orm import scoped_session
-from sqlalchemy.orm.session import sessionmaker
 
 from book import Book
 from db.meta import Base
@@ -41,7 +37,6 @@ class TestBooksDao(unittest2.TestCase):
         return BooksDao(self.SQLALCHEMY_URL)
 
     def sync_db(self):
-        from db.models import Base
         Base.metadata.create_all(self.tested_dao.session.bind)
 
     def get_book_by_path(self, path):
