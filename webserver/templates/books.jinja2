@@ -1,0 +1,21 @@
+{% extends 'base.jinja2' %}
+
+{% block styles %}
+    <link rel="stylesheet" href="/css/books.css" />
+{% endblock %}
+
+{% block content %}
+    <ul id="books-list">
+        {% for book in books %}
+        <li class="{{ loop.cycle('odd', 'even') }}">
+            <a href="" class="author">
+                {{ book.author.first_name }} {{ book.author.last_name }}
+            </a>
+            &mdash;
+            <a href="" class="book">
+                {{ book.title }}
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+{% endblock %}
