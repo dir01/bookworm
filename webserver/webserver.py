@@ -9,6 +9,8 @@ def make_app():
     config.add_jinja2_search_path('webserver:templates')
     config.scan('webserver.views')
     config.add_static_view(name='css', path='webserver:static/css')
+    config.add_static_view(name='js', path='webserver:static/js')
+    config.add_static_view(name='img', path='webserver:static/img')
     config.add_route('index', '/')
     config.add_route('search', '/search/')
 

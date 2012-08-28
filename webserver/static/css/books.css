@@ -1,9 +1,0 @@
-#books-list {
-    font-size: 150%;
-    list-style: none;
-    color: #555;
-}
-#books-list a { text-decoration: none; }
-#books-list a:hover { text-decoration: underline; }
-#books-list a.author { color: #999; }
-#books-list a.book { color: #555 }
