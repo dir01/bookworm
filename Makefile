@@ -13,6 +13,10 @@ test: # Run unit tests
 	go test --tags "fts5" ./...
 .PHONY: test
 
+docker-test: # Run unit tests in a Docker container
+	docker-compose run --rm --build bookworm make test
+.PHONY: docker-test
+
 precommit: # Run all possible checks before committing
 	make generate
 	make format
