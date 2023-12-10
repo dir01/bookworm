@@ -3,7 +3,7 @@ help: # Show help for each of the Makefile recipes.
 .PHONY: help
 
 run: # Run the servie (useful for local development)
-	DB_PATH=db/sqlite.db go run .
+	DB_PATH=db/sqlite.db go run --tags "fts5" .
 .PHONY: run
 
 build: # Build the service binary
