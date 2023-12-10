@@ -160,7 +160,7 @@ func (s *Service) GetBook(ctx context.Context, id int64, outFormat FileType) (
 				if err != nil {
 					return nil, cleanup, fmt.Errorf("error opening file %q in zip archive %q: %w", f.Name, bookMetadata.FilePath, err)
 				}
-				break
+				goto convert // we might need to format the file, so we can't return here
 			}
 		}
 		return nil, cleanup, fmt.Errorf("file %q not found in zip archive %q", bookMetadata.SubFilepath, bookMetadata.FilePath)
@@ -168,6 +168,7 @@ func (s *Service) GetBook(ctx context.Context, id int64, outFormat FileType) (
 		return nil, cleanup, fmt.Errorf("unknown file type %q", bookMetadata.FileType)
 	}
 
+convert:
 	switch outFormat {
 	case FB2:
 		return sourceFile, cleanup, nil

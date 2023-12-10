@@ -74,7 +74,7 @@ func TestService(t *testing.T) {
 	})
 	// endregion
 
-	// Test that plain .fb2 files are also indexed
+	// region  Test that plain .fb2 files are also indexed
 	copyTestFB2(t, tempDir, "The Republic of Plato - FB2.fb2")
 
 	eventually(t, 5*time.Second, 100*time.Millisecond, func() (bool, error) {
@@ -103,6 +103,25 @@ func TestService(t *testing.T) {
 			t.Fatalf("expected file, got nil")
 		}
 	}
+	// endregion
+
+	// region Test ability to get converted books from zip archive
+	if results, err := svc.Search(ctx, "Aristotle"); err != nil {
+		t.Fatalf("error searching Aristotle: %v", err)
+	} else {
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+
+		file, cleanup, err := svc.GetBook(ctx, results[0].ID, EPUB)
+		if err != nil {
+			t.Fatalf("error getting converted book: %v", err)
+		}
+		defer cleanup()
+		if file == nil {
+			t.Fatalf("expected file, got nil")
+		}
+	} // endregion
 }
 
 func eventually(t *testing.T, ttl time.Duration, tick time.Duration, f func() (bool, error)) {
