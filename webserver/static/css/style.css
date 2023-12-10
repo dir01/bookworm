@@ -1,4 +1,0 @@
-html, body, #hero-row { height: 100%; }
-#hero-row { position: relative; }
-#hero-container { position: absolute; top: 25%; margin-top: -150px; }
-#search-input { width: 70%; height: 30px; }
