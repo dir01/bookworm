@@ -1,0 +1,12 @@
+version: '2'
+services:
+  bookworm:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+        - ./db/sqlite.db:/app/sqlite.db
+    environment:
+      DB_PATH: /app/sqlite.db
+      BOOKS_DIR: /app/books
+      BIND_ADDR: 0.0.0.0:8080
