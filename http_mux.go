@@ -68,7 +68,7 @@ func (h *httpServer) bookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=book-%d.%h", id, format))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=book-%d.%s", id, format))
 	w.Header().Set("Content-Type", "application/octet-stream")
 
 	_, err = io.Copy(w, book)
