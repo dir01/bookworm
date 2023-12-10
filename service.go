@@ -47,7 +47,7 @@ type BookMetadata struct {
 	HasCover        bool   `db:"has_cover"`
 }
 
-type Store interface {
+type ServiceStore interface {
 	// Store saves a batch of books metadata to database.
 	// If books records already exist in database, they will be updated.
 	// If books reside in an archive, all books of the archive MUST be updated at once.
@@ -65,7 +65,7 @@ type Store interface {
 	GetBook(ctx context.Context, id int64) (*BookMetadata, error)
 }
 
-func NewService(path string, store Store) (*Service, error) {
+func NewService(path string, store ServiceStore) (*Service, error) {
 	return &Service{
 		dirPath:     path,
 		filesChan:   make(chan string),
@@ -83,7 +83,7 @@ type Service struct {
 	dirPath     string
 	filesChan   chan string
 	fileWorkers int
-	store       Store
+	store       ServiceStore
 }
 
 // Run starts the service: starts the file system watcher and required workers

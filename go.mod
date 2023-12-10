@@ -8,6 +8,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.18
 	github.com/rubenv/sql-migrate v1.5.2
 	github.com/tamerh/xml-stream-parser v1.4.0
+	gopkg.in/telebot.v3 v3.2.1
 )
 
 require (

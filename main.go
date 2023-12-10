@@ -17,14 +17,21 @@ func main() {
 	if dbPath == "" {
 		log.Fatalf("[main] DB_PATH env var is not set")
 	}
+
 	booksDir := os.Getenv("BOOKS_DIR")
 	if booksDir == "" {
 		log.Fatalf("[main] BOOKS_DIR env var is not set")
 	}
+
 	bindAddr := os.Getenv("BIND_ADDR")
 	if bindAddr == "" {
 		bindAddr = ":8080"
 		log.Println("[main] BIND_ADDR env var is not set, using default :8080")
+	}
+
+	telegramToken := os.Getenv("TELEGRAM_TOKEN")
+	if telegramToken == "" {
+		log.Printf("[main] TELEGRAM_TOKEN env var is not set, telegram bot will not be started")
 	}
 
 	db := sqlx.MustConnect("sqlite3", dbPath)
@@ -54,14 +61,14 @@ func main() {
 	}()
 
 	mux := NewHttpMux(svc)
-	srv := &http.Server{
+	httpServer := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
 	}
 
 	go func() {
 		log.Printf("[main] listening on %s", bindAddr)
-		if err := srv.ListenAndServe(); err != nil {
+		if err := httpServer.ListenAndServe(); err != nil {
 			if errors.Is(err, http.ErrServerClosed) {
 				log.Printf("[main] server closed")
 				return
@@ -70,12 +77,30 @@ func main() {
 		}
 	}()
 
+	var bot *TelegramBot
+	if telegramToken != "" {
+		var err error
+		bot, err = NewTelegramBot(telegramToken, []string{"dockerfile"}, svc)
+		if err != nil {
+			log.Fatalf("[main] can't create telegram bot: %v", err)
+		}
+		go func() {
+			log.Printf("[main] starting telegram bot")
+			bot.Start()
+		}()
+	}
+
 	<-ctx.Done()
+
+	if bot != nil {
+		log.Printf("[main] stopping telegram bot")
+		bot.Stop()
+	}
 
 	log.Printf("[main] shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("[main] can't shutdown server: %v", err)
 	}
 }
