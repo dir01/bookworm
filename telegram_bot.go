@@ -75,7 +75,7 @@ func (b *TelegramBot) handleMessage(c tele.Context) error {
 		return c.Send("Sorry, something went wrong, please try again later")
 	case len(books) == 0:
 		return c.Send("Sorry, no books found")
-	case len(books) > 20:
+	case len(books) > 100:
 		return c.Send(fmt.Sprintf("Sorry, found too many books: %d. Please try to narrow down your search", len(books)))
 	default:
 		return b.sendBooks(c, books)
