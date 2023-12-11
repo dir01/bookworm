@@ -18,10 +18,10 @@ docker-test: # Run unit tests in a Docker container
 .PHONY: docker-test
 
 precommit: # Run all possible checks before committing
-	make generate
-	make format
 	make vendor
 	make tidy
+	make generate
+	make format
 	make build
 	make test
 .PHONY: precommit
@@ -32,7 +32,7 @@ generate: # Generate auto-generated code
 format: # Format the code
 	go fmt ./...
 
-vendor: # Cache dependencies from go.mod into vendor/ directoryk
+vendor: # Cache dependencies from go.mod into vendor/ directory
 	go mod vendor
 
 tidy: # Clean up unused dependencies from go.sum
