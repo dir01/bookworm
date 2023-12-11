@@ -319,7 +319,10 @@ func (s *Service) startFileWorker(ctx context.Context) {
 				log.Printf("[service] storing %d metadatas from %s\n", len(mds), path)
 
 				if len(mds) > 0 {
-					s.store.Store(ctx, mds)
+					if err := s.store.Store(ctx, mds); err != nil {
+						log.Printf("[service] ERROR storing metadata from file %q: %v\n", path, err)
+						continue
+					}
 				}
 
 				z.Close()
