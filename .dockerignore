@@ -1,8 +1,9 @@
 .idea/
 .github/
 bin/
-.gitignore
 .git
+.gitignore
+db/sqlite.db
 Dockerfile
 docker-compose.yml
 
