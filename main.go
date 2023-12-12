@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -32,6 +33,15 @@ func main() {
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
 	if telegramToken == "" {
 		log.Printf("[main] TELEGRAM_TOKEN env var is not set, telegram bot will not be started")
+	}
+
+	var telegramAuthorizedUsers []string
+	telegramAuthorizedUsersStr := os.Getenv("TELEGRAM_AUTHORIZED_USERS")
+	switch {
+	case telegramAuthorizedUsersStr == "" && telegramToken != "":
+		log.Fatalf("[main] TELEGRAM_AUTHORIZED_USERS env var is not set")
+	case telegramAuthorizedUsersStr != "":
+		telegramAuthorizedUsers = strings.Split(telegramAuthorizedUsersStr, ",")
 	}
 
 	db := sqlx.MustConnect("sqlite3", dbPath)
@@ -80,7 +90,7 @@ func main() {
 	var bot *TelegramBot
 	if telegramToken != "" {
 		var err error
-		bot, err = NewTelegramBot(telegramToken, []string{"dockerfile"}, svc)
+		bot, err = NewTelegramBot(telegramToken, telegramAuthorizedUsers, svc)
 		if err != nil {
 			log.Fatalf("[main] can't create telegram bot: %v", err)
 		}
