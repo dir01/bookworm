@@ -84,6 +84,11 @@ func (b *TelegramBot) handleMessage(c tele.Context) error {
 
 func (b *TelegramBot) sendBooks(c tele.Context, metas []*BookMetadata) error {
 	for _, m := range metas {
+		bookTitle := fmt.Sprintf("[%s %s] - %s", m.AuthorLastName, m.AuthorFirstName, m.Title)
+		if m.Date != "" {
+			bookTitle += fmt.Sprintf(" (%s)", m.Date)
+		}
+
 		markup := &tele.ReplyMarkup{}
 		epubBtn := tele.Btn{
 			Unique: actionDownload,
@@ -91,10 +96,8 @@ func (b *TelegramBot) sendBooks(c tele.Context, metas []*BookMetadata) error {
 			Data:   fmt.Sprintf("epub|%d", m.ID),
 		}
 		markup.Inline(markup.Row(epubBtn))
-		if err := c.Send(
-			fmt.Sprintf("[%s %s] - %s (%s)", m.AuthorLastName, m.AuthorFirstName, m.Title, m.Date),
-			markup,
-		); err != nil {
+
+		if err := c.Send(bookTitle, markup); err != nil {
 			return err
 		}
 	}
