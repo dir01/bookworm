@@ -5,7 +5,7 @@ go 1.21.1
 require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/jmoiron/sqlx v1.3.5
-	github.com/mattn/go-sqlite3 v1.14.18
+	github.com/mattn/go-sqlite3 v1.14.21
 	github.com/rubenv/sql-migrate v1.5.2
 	github.com/tamerh/xml-stream-parser v1.4.0
 	gopkg.in/telebot.v3 v3.2.1
