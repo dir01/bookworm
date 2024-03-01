@@ -32,12 +32,12 @@ func (N Number) Decompose(buf []byte) (form byte, negative bool, coefficient []b
 		negative = true
 	}
 	c := (i.BitLen() + 7) >> 3
-	if c <= cap(buf) {
+	if buf != nil && c <= cap(buf) {
 		buf = buf[:c]
 	} else {
 		buf = make([]byte, c)
 	}
-	return 0, negative, fillBytes(&i, buf), exponent
+	return 0, negative, i.FillBytes(buf), exponent
 }
 
 // Compose sets the internal decimal value from parts. If the value cannot be
@@ -113,7 +113,7 @@ type decimal interface {
 }
 
 type decimalDecompose interface {
-	// Decompose returns the internal decimal state in parts.
+	// Decompose returns the internal decimal state into parts.
 	// If the provided buf has sufficient capacity, buf may be returned as the coefficient with
 	// the value set and length set as appropriate.
 	Decompose(buf []byte) (form byte, negative bool, coefficient []byte, exponent int32)

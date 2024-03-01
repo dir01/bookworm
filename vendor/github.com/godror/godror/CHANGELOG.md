@@ -6,6 +6,154 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [v0.40.3]
+### Changed
+- Fix compilation regression with Go 1.19, caused by introducing log/slog.
+
+## [v0.40.2]
+### Changed
+- Fix performance issue of #301.
+
+## [v0.40.0]
+### Changed
+- ODPI-C v5.0.0
+
+## [v0.39.3]
+### Changed
+- Make resources' (last resort) Close with Finalizers opt-in with GuardWithFinalizers().
+- Remove string/Number interning, as it resulted higher memory usage.
+- Simplify DB time zone caching's key.
+
+## [v0.39.2]
+### Changed
+- simplify handleDeadline, hopefully eliminiate SIGSEGVs
+
+## [v0.39.1]
+### Changed
+- Update golang.org/x/exp/slog
+- Raise 3s default first connection timeout to 10s
+
+## [v0.39.0]
+### Changed
+- Use ODPI-C v5.0
+
+## [v0.38.0]
+### Added
+- Auto-start queue on specific failures (if possible)
+- NumberAsFloat64 option to return every number as float64
+
+## Changed
+- Log with slog (use github.com/godror/godror/slog shim or directly log/slog or golang.org/x/exp/slog)
+
+## [v0.37.0]
+### Changed
+- ODPI-C v4.6.1
+
+## [v0.36.0]
+### Added
+- initOnNewConnection connection flag to call OnInit only when the connection is new.
+
+## [v0.35.0]
+### Changed
+- Use ODPI-v4.6.0
+
+## [v0.34.0]
+### Added
+- ObjectType.AttributeNames() returns the attribute names in DB order.
+- PoolStats has a DBStats method to convert it to sql.DBStats.
+- By embedding godror.ObjectTypeName and setting the field tag with `"godror:,type=my_pkg.type"` you can use structs in place of Oracle objects in ExecStmt.
+
+## [v0.33.0]
+### Changed
+- SetLogger accept github.com/go-logr/logr.Logger
+
+## [v0.32.0]
+- Update to Go 1.15 as minimal required version.
+
+## [v0.31.0]
+### Added
+- NumberAsString option
+- Queue.PurgeExpired
+### Changed
+- By default, return Number for numbers (not string)
+- Always run session Init functions
+
+## [v0.30.2]
+### Changed
+- Fix Queue.Dequeue to work with non-existing MsgID (#201).
+
+## [v0.30.1]
+### Added
+- Object{,Collection}.FromJSON
+
+## [v0.30.0]
+### Added
+- Object{,Collection}.{AsMap,ToJSON}
+
+### Changed
+- DeqOptions.MsgID changed from string to []byte
+
+## [v0.29.0]
+### Added
+- Add github.com/godror/knownpb/timestamppb.Timestamp
+### Changed
+- Remove pbTimestamp (behind timestamppb tag), github.com/UNO-SOFT/knownpb/timestamppb implements driver.Valuer and sql.Scanner.
+
+## [v0.28.1]
+### Changed
+- ODPI-C v4.3.0
+### Added 
+- Add NewTempLob to the Conn interface for #189.
+
+## [v0.28.0]
+### Changed
+- Remove ObjectType.NewData, to get rid of the dependency on *conn in ObjectType, for #172
+
+## [v0.27.1]
+### Added
+- Size, ReadAt methods to dpiLobReader
+
+## [v0.27.0]
+### Changed
+- Instead of Log package-level variable, use SetLog or SetLogger.
+
+## [v0.26.0]
+### Added
+- Batch type for batching ExecContext calls.
+- Add support for native JSON type support (for DB21.3)
+
+## [v0.25.6]
+### Changed
+- Fix lobReader buffering which caused short reads.
+
+## [v0.25.4]
+### Added
+- Implement use of "google.golang.org/protobuf/types/known/timestamppb".Timestamp,
+  behind the timestamppb tag
+
+### Changed
+- Use dpiConn_setCallTimeout for faster recovers.
+- Faster setTraceTag, drv.init.
+- Buffer dpiLobReader.Read with chunk-sized reads for 
+  * avoiding io.ReadAll short read and
+  * performance
+
+## [v0.25.2]
+### Changed
+- Go 1.14 minimum requirement
+
+## [v0.25.1]
+### Added
+- Add stmtCacheSize, poolMaxSessionPerShard, poolPingInterval params
+- OnInit use context.Context
+
+### Changed
+- Use ODPI-C v4.2.1
+
+## [v0.24.3]
+### Added
+- IsBadConn to check for the several error numbers all indicate connection failure
+
 ## [v0.24.0]
 ### Added
 - noTimezoneCheck flag in connection string to suppress the WARNING printout

@@ -1,12 +1,25 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
-// This program is free software: you can modify it and/or redistribute it
-// under the terms of:
+// Copyright (c) 2016, 2022, Oracle and/or its affiliates.
 //
-// (i)  the Universal Permissive License v 1.0 or at your option, any
-//      later version (http://oss.oracle.com/licenses/upl); and/or
+// This software is dual-licensed to you under the Universal Permissive License
+// (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl and Apache License
+// 2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose
+// either license.
 //
-// (ii) the Apache License v 2.0. (http://www.apache.org/licenses/LICENSE-2.0)
+// If you elect to accept the software under the Apache License, Version 2.0,
+// the following applies:
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //-----------------------------------------------------------------------------
 
 //-----------------------------------------------------------------------------
@@ -46,6 +59,7 @@ static void *dpiGlobalEnvHandle = NULL;
 static void *dpiGlobalErrorHandle = NULL;
 static void *dpiGlobalThreadKey = NULL;
 static dpiErrorBuffer dpiGlobalErrorBuffer;
+static dpiVersionInfo dpiGlobalClientVersionInfo;
 static int dpiGlobalInitialized = 0;
 
 // a global mutex is used to ensure that only one thread is used to perform
@@ -54,7 +68,7 @@ static dpiMutexType dpiGlobalMutex;
 
 // forward declarations of internal functions only used in this file
 static int dpiGlobal__extendedInitialize(dpiContextCreateParams *params,
-        dpiVersionInfo **clientVersionInfo, dpiError *error);
+        const char *fnName, dpiError *error);
 static void dpiGlobal__finalize(void);
 static int dpiGlobal__getErrorBuffer(const char *fnName, dpiError *error);
 
@@ -82,12 +96,13 @@ int dpiGlobal__ensureInitialized(const char *fnName,
     if (!dpiGlobalInitialized) {
         dpiMutex__acquire(dpiGlobalMutex);
         if (!dpiGlobalInitialized)
-            dpiGlobal__extendedInitialize(params, clientVersionInfo, error);
+            dpiGlobal__extendedInitialize(params, fnName, error);
         dpiMutex__release(dpiGlobalMutex);
         if (!dpiGlobalInitialized)
             return DPI_FAILURE;
     }
 
+    *clientVersionInfo = &dpiGlobalClientVersionInfo;
     return dpiGlobal__getErrorBuffer(fnName, error);
 }
 
@@ -100,12 +115,17 @@ int dpiGlobal__ensureInitialized(const char *fnName,
 // IANA or Oracle character set name.
 //-----------------------------------------------------------------------------
 static int dpiGlobal__extendedInitialize(dpiContextCreateParams *params,
-        dpiVersionInfo **clientVersionInfo, dpiError *error)
+        const char *fnName, dpiError *error)
 {
     int status;
 
+    // initialize debugging
+    dpiDebug__initialize();
+    if (dpiDebugLevel & DPI_DEBUG_LEVEL_FNS)
+        dpiDebug__print("fn start %s\n", fnName);
+
     // load OCI library
-    if (dpiOci__loadLib(params, clientVersionInfo, error) < 0)
+    if (dpiOci__loadLib(params, &dpiGlobalClientVersionInfo, error) < 0)
         return DPI_FAILURE;
 
     // create threaded OCI environment for storing error buffers and for
@@ -261,7 +281,6 @@ DPI_INITIALIZER(dpiGlobal__initialize)
     memset(&dpiGlobalErrorBuffer, 0, sizeof(dpiGlobalErrorBuffer));
     strcpy(dpiGlobalErrorBuffer.encoding, DPI_CHARSET_NAME_UTF8);
     dpiMutex__initialize(dpiGlobalMutex);
-    dpiDebug__initialize();
     atexit(dpiGlobal__finalize);
 }
 

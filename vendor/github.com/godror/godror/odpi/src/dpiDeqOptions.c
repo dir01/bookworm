@@ -1,12 +1,25 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
-// This program is free software: you can modify it and/or redistribute it
-// under the terms of:
+// Copyright (c) 2016, 2022, Oracle and/or its affiliates.
 //
-// (i)  the Universal Permissive License v 1.0 or at your option, any
-//      later version (http://oss.oracle.com/licenses/upl); and/or
+// This software is dual-licensed to you under the Universal Permissive License
+// (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl and Apache License
+// 2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose
+// either license.
 //
-// (ii) the Apache License v 2.0. (http://www.apache.org/licenses/LICENSE-2.0)
+// If you elect to accept the software under the Apache License, Version 2.0,
+// the following applies:
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //-----------------------------------------------------------------------------
 
 //-----------------------------------------------------------------------------
@@ -37,6 +50,10 @@ int dpiDeqOptions__create(dpiDeqOptions *options, dpiConn *conn,
 //-----------------------------------------------------------------------------
 void dpiDeqOptions__free(dpiDeqOptions *options, dpiError *error)
 {
+    if (options->msgIdRaw) {
+        dpiOci__rawResize(options->env->handle, &options->msgIdRaw, 0, error);
+        options->msgIdRaw = NULL;
+    }
     if (options->handle) {
         dpiOci__descriptorFree(options->handle, DPI_OCI_DTYPE_AQDEQ_OPTIONS);
         options->handle = NULL;
@@ -305,7 +322,6 @@ int dpiDeqOptions_setMode(dpiDeqOptions *options, dpiDeqMode value)
 int dpiDeqOptions_setMsgId(dpiDeqOptions *options, const char *value,
         uint32_t valueLength)
 {
-    void *rawValue = NULL;
     dpiError error;
     int status;
 
@@ -314,12 +330,11 @@ int dpiDeqOptions_setMsgId(dpiDeqOptions *options, const char *value,
         return dpiGen__endPublicFn(options, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(options, value)
     if (dpiOci__rawAssignBytes(options->env->handle, value, valueLength,
-            &rawValue, &error) < 0)
+            &options->msgIdRaw, &error) < 0)
         return dpiGen__endPublicFn(options, DPI_FAILURE, &error);
     status = dpiOci__attrSet(options->handle, DPI_OCI_DTYPE_AQDEQ_OPTIONS,
-            (void*) &rawValue, valueLength, DPI_OCI_ATTR_DEQ_MSGID,
+            (void*) &options->msgIdRaw, valueLength, DPI_OCI_ATTR_DEQ_MSGID,
             "set value", &error);
-    dpiOci__rawResize(options->env->handle, &rawValue, 0, &error);
     return dpiGen__endPublicFn(options, status, &error);
 }
 

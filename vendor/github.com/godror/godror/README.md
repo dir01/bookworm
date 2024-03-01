@@ -10,20 +10,24 @@
 for connecting to Oracle DB, using Anthony Tuininga's excellent OCI wrapper,
 [ODPI-C](https://www.github.com/oracle/odpi).
 
-At least Go 1.13 is required!
-Cgo is required, so cross-compilation is hard, and you cannot set `CGO_ENABLED=0`!
+## Build-time Requirements
+  - Go 1.15
+  - C compiler with `CGO_ENABLED=1` - so cross-compilation is hard
+
+## Run-time Requirements
+  - Oracle Client libraries - see [ODPI-C](https://oracle.github.io/odpi/doc/installation.html) 
 
 Although Oracle Client libraries are NOT required for compiling, they *are*
 needed at run time.  Download the free Basic or Basic Light package from
 <https://www.oracle.com/database/technologies/instant-client/downloads.html>.
 
-### Rationale
+## Rationale
 
 With Go 1.9, driver-specific things are not needed, everything (I need) can be
 achieved with the standard _database/sql_ library. Even calling stored
 procedures with OUT parameters, or sending/retrieving PL/SQL array types - just
-give a `godror.PlSQLArrays` Option within the parameters of `Exec`!  For
-example, the array size of the returned PL/SQL arrays can be set with
+give a `godror.PlSQLArrays` Option within the parameters of `Exec` (but not in sql.Named)! 
+For example, the array size of the returned PL/SQL arrays can be set with
 `godror.ArraySize(2000)` (default value is 1024).
 
 ## Documentation
@@ -36,10 +40,17 @@ the [Godror User Guide](https://godror.github.io/godror/doc/contents.html).
 Run:
 
 ```bash
-go get github.com/godror/godror
+go get github.com/godror/godror@latest
 ```
 
 Then install Oracle Client libraries and you're ready to go!
+
+godror is cgo package. 
+If you want to build your app using godror, you need gcc (a C compiler).
+
+Important: because this is a CGO enabled package, 
+you are required to set the environment variable `CGO_ENABLED=1` 
+and have a gcc compile present within your path.
 
 See [Godror
 Installation](https://godror.github.io/godror/doc/installation.html) for more information.
@@ -60,6 +71,9 @@ The `connectString` can be _ANYTHING_ that SQL*Plus or Oracle Call Interface
 string](https://download.oracle.com/ocomdocs/global/Oracle-Net-19c-Easy-Connect-Plus.pdf)
 like `host:port/service_name`, or a connect descriptor like `(DESCRIPTION=...)`.
 
+You can specify connection timeout seconds with "?connect_timeout=15" - Ping uses this timeout, NOT the Deadline in Context!
+Note that `connect_timeout` requires at least 19c client.
+
 For more connection options, see [Godor Connection
 Handling](https://godror.github.io/godror/doc/connection.html).
 
@@ -74,12 +88,19 @@ See [z_qrcn_test.go](./z_qrcn_test.go) for using that to reach
 
 Use `ExecContext` and mark each OUT parameter with `sql.Out`.
 
+As sql.DB will close the statemenet ASAP, for long-lived objects (LOB, REF CURSOR),
+you have to keep the Stmt alive: Prepare the statement, 
+and Close only after finished with the Lob/Rows.
+
 ### Using cursors returned by stored procedures
 
 Use `ExecContext` and an `interface{}` or a `database/sql/driver.Rows` as the `sql.Out` destination,
 then either use the `driver.Rows` interface,
 or transform it into a regular `*sql.Rows` with `godror.WrapRows`,
 or (since Go 1.12) just Scan into `*sql.Rows`.
+
+As sql.DB will close the statemenet ASAP, you have to keep the Stmt alive: 
+Prepare the statement, and Close only after finished with the Rows.
 
 For examples, see Anthony Tuininga's
 [presentation about Go](https://static.rainfocus.com/oracle/oow19/sess/1567058525476001cK8G/PF/DEV6708-Using-the-Go-Language-for-Efficient-Oracle-Database-Applications_1568841171132001jI7d.pdf)
@@ -113,6 +134,8 @@ For `PLS_INTEGER` and `BINARY_INTEGER` (PL/SQL data types) you can use `int32`.
 From 2.9.0, LOBs are returned as string/[]byte by default (before it needed the `ClobAsString()` option).
 Now it's reversed, and the default is string, to get a Lob reader, give the `LobAsReader()` option.
 
+Watch out, Oracle will error out if the CLOB is too large, and you have to use `godror.Lob` in such cases!
+
 If you return Lob as a reader, watch out with `sql.QueryRow`, `sql.QueryRowContext` !
 They close the statement right after you `Scan` from the returned `*Row`, the returned `Lob` will be invalid, producing
 `getSize: ORA-00000: DPI-1002: invalid dpiLob handle`.
@@ -144,9 +167,14 @@ then set the "location" in  the connection string, or the `Timezone` in the `Con
 ```go
 var rset1, rset2 driver.Rows
 
-query := `BEGIN Package.StoredProcA(123, :1, :2); END;`
+const query = `BEGIN Package.StoredProcA(123, :1, :2); END;`
 
-if _, err := db.ExecContext(ctx, query, sql.Out{Dest: &rset1}, sql.Out{Dest: &rset2}); err != nil {
+stmt, err := db.PrepareContext(ctx, query)
+if err != nil {
+    return fmt.Errorf("%s: %w", query, err)
+}
+defer stmt.Close()
+if _, err := stmt.ExecContext(ctx, sql.Out{Dest: &rset1}, sql.Out{Dest: &rset2}); err != nil {
 	log.Printf("Error running %q: %+v", query, err)
 	return
 }
