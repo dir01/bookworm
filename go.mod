@@ -7,7 +7,7 @@ require (
 	github.com/jmoiron/sqlx v1.3.5
 	github.com/mattn/go-sqlite3 v1.14.21
 	github.com/rubenv/sql-migrate v1.6.1
-	github.com/tamerh/xml-stream-parser v1.4.0
+	github.com/tamerh/xml-stream-parser v1.5.0
 	gopkg.in/telebot.v3 v3.2.1
 )
 
