@@ -1,4 +1,4 @@
-// Copyright 2019, 2020 The Godror Authors
+// Copyright 2019, 2022 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -6,19 +6,21 @@
 package dsn
 
 import (
+	"context"
 	"database/sql/driver"
-	"encoding/base64"
+	"encoding"
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logfmt/logfmt"
-	errors "golang.org/x/xerrors"
+	"github.com/godror/godror/slog"
 )
 
 const (
@@ -45,24 +47,53 @@ const (
 	DefaultStandaloneConnection = false
 )
 
-// CommonParams holds the common parameters for pooled or standalone connections.
-type CommonParams struct {
+type CommonSimpleParams struct {
+	Timezone                *time.Location
+	ConfigDir, LibDir       string
 	Username, ConnectString string
 	Password                Password
-	ConfigDir, LibDir       string
-	// OnInit is executed on session init. Overrides AlterSession and OnInitStmts!
-	OnInit func(driver.Conn) error
-	// OnInitStmts are executed on session init, iff OnInit is nil.
-	OnInitStmts []string
-	// AlterSession key-values are set with "ALTER SESSION SET key=value" on session init, iff OnInit is nil.
-	AlterSession            [][2]string
-	Timezone                *time.Location
+	Charset                 string
+	// StmtCacheSize of 0 means the default, -1 to disable the stmt cache completely
+	StmtCacheSize int
+	// true: OnInit will be called only by the new session / false: OnInit will called by new or pooled connection
+	InitOnNewConn           bool
 	EnableEvents, NoTZCheck bool
 }
 
-// String returns the string representation of CommonParams.
+// CommonParams holds the common parameters for pooled or standalone connections.
+//
+// For details, see https://oracle.github.io/odpi/doc/structs/dpiCommonCreateParams.html#dpicommoncreateparams
+type CommonParams struct {
+	CommonSimpleParams
+	// Logger is the per-pool or per-connection logger.
+	// The default nil logger does not log.
+	Logger *slog.Logger
+	// OnInit is executed on session init. Overrides AlterSession and OnInitStmts!
+	OnInit func(context.Context, driver.ConnPrepareContext) error
+	// OnInitStmts are executed on session init, iff OnInit is nil.
+	OnInitStmts []string
+	// AlterSession key-values are set with "ALTER SESSION SET key=value" on session init, iff OnInit is nil.
+	AlterSession [][2]string
+}
+
 func (P CommonParams) String() string {
-	q := newParamsArray(8)
+	return P.CommonSimpleParams.String()
+}
+
+var cacheCPSMu sync.RWMutex
+var cacheCPS = make(map[CommonSimpleParams]string)
+
+// String returns the string representation of CommonParams.
+func (P CommonSimpleParams) String() string {
+	cacheCPSMu.RLock()
+	s, ok := cacheCPS[P]
+	cacheCPSMu.RUnlock()
+	if ok {
+		return s
+	}
+
+	q := acquireParamsArray(8)
+	defer releaseParamsArray(q)
 	q.Add("user", P.Username)
 	q.Add("password", P.Password.String())
 	q.Add("connectString", P.ConnectString)
@@ -72,7 +103,6 @@ func (P CommonParams) String() string {
 	if P.LibDir != "" {
 		q.Add("libDir", P.LibDir)
 	}
-	var s string
 	tz := P.Timezone
 	if tz != nil {
 		if tz == time.Local {
@@ -88,21 +118,37 @@ func (P CommonParams) String() string {
 	if P.NoTZCheck {
 		q.Add("noTimezoneCheck", "1")
 	}
+	if P.StmtCacheSize != 0 {
+		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
+	}
+	if P.Charset != "" {
+		q.Add("charset", P.Charset)
+	}
+	if P.InitOnNewConn {
+		q.Add("initOnNewConnection", "1")
+	}
 
-	return q.String()
+	s = q.String()
+	cacheCPSMu.Lock()
+	cacheCPS[P] = s
+	cacheCPSMu.Unlock()
+	return s
 }
 
 // ConnParams holds the connection-specific parameters.
+//
+// For details, see https://oracle.github.io/odpi/doc/structs/dpiConnCreateParams.html#dpiconncreateparams
 type ConnParams struct {
 	NewPassword                             Password
 	ConnClass                               string
-	IsSysDBA, IsSysOper, IsSysASM, IsPrelim bool
 	ShardingKey, SuperShardingKey           []interface{}
+	IsSysDBA, IsSysOper, IsSysASM, IsPrelim bool
 }
 
 // String returns the string representation of the ConnParams.
 func (P ConnParams) String() string {
-	q := newParamsArray(8)
+	q := acquireParamsArray(8)
+	defer releaseParamsArray(q)
 	if P.ConnClass != "" {
 		q.Add("connectionClass", P.ConnClass)
 	}
@@ -128,17 +174,27 @@ func (P ConnParams) String() string {
 }
 
 // PoolParams holds the configuration of the Oracle Session Pool.
+//
+// For details, see https://oracle.github.io/odpi/doc/structs/dpiPoolCreateParams.html#dpipoolcreateparams
+//
+// For details, see https://oracle.github.io/odpi/doc/structs/dpiPoolCreateParams.html#dpipoolcreateparams
 type PoolParams struct {
 	MinSessions, MaxSessions, SessionIncrement int
+	MaxSessionsPerShard                        int
 	WaitTimeout, MaxLifeTime, SessionTimeout   time.Duration
+	PingInterval                               time.Duration
 	Heterogeneous, ExternalAuth                bool
 }
 
 // String returns the string representation of PoolParams.
 func (P PoolParams) String() string {
-	q := newParamsArray(8)
+	q := acquireParamsArray(8)
+	defer releaseParamsArray(q)
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
 	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	if P.MaxSessionsPerShard != 0 {
+		q.Add("poolMasSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
+	}
 	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
 	if P.Heterogeneous {
 		q.Add("heterogeneousPool", "1")
@@ -149,6 +205,9 @@ func (P PoolParams) String() string {
 	if P.ExternalAuth {
 		q.Add("externalAuth", "1")
 	}
+	if P.PingInterval != 0 {
+		q.Add("pingInterval", P.PingInterval.String())
+	}
 	return q.String()
 }
 
@@ -156,8 +215,8 @@ func (P PoolParams) String() string {
 // You can use ConnectionParams{...}.StringWithPassword()
 // as a connection string in sql.Open.
 type ConnectionParams struct {
-	CommonParams
 	ConnParams
+	CommonParams
 	PoolParams
 	// ConnParams.NewPassword is used iff StandaloneConnection is true!
 	StandaloneConnection bool
@@ -191,13 +250,13 @@ func (P *ConnectionParams) SetSessionParamOnInit(k, v string) {
 }
 
 // String returns the string representation of ConnectionParams.
-// The password is replaced with a "SECRET" string!
+// The password is replaced with a "***" string!
 func (P ConnectionParams) String() string {
 	return P.string(true, false)
 }
 
 // StringNoClass returns the string representation of ConnectionParams, without class info.
-// The password is replaced with a "SECRET" string!
+// The password is replaced with a "***" string!
 func (P ConnectionParams) StringNoClass() string {
 	return P.string(false, false)
 }
@@ -209,7 +268,8 @@ func (P ConnectionParams) StringWithPassword() string {
 }
 
 func (P ConnectionParams) string(class, withPassword bool) string {
-	q := newParamsArray(32)
+	q := acquireParamsArray(32)
+	defer releaseParamsArray(q)
 	q.Add("connectString", P.ConnectString)
 	s := P.ConnClass
 	if !class {
@@ -243,8 +303,17 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 		return "0"
 	}
 	q.Add("noTimezoneCheck", B(P.NoTZCheck))
+	if P.StmtCacheSize != 0 {
+		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
+	}
+	if P.Charset != "" {
+		q.Add("charset", P.Charset)
+	}
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
 	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	if P.MaxSessionsPerShard != 0 {
+		q.Add("poolMasSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
+	}
 	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
 	q.Add("sysdba", B(P.IsSysDBA))
 	q.Add("sysoper", B(P.IsSysOper))
@@ -257,12 +326,15 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	q.Add("poolWaitTimeout", P.WaitTimeout.String())
 	q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
 	q.Add("poolSessionTimeout", P.SessionTimeout.String())
-	as := newParamsArray(1)
+	q.Add("pingInterval", P.PingInterval.String())
+	as := acquireParamsArray(1)
+	defer releaseParamsArray(as)
 	for _, kv := range P.AlterSession {
 		as.Reset()
 		as.Add(kv[0], kv[1])
 		q.Add("alterSession", strings.TrimSpace(as.String()))
 	}
+	q.Add("initOnNewConnection", B(P.InitOnNewConn))
 	q.Values["onInit"] = P.OnInitStmts
 	q.Add("configDir", P.ConfigDir)
 	q.Add("libDir", P.LibDir)
@@ -272,6 +344,8 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 }
 
 // Parse parses the given connection string into a struct.
+//
+// For examples, see [../doc/connection.md](../doc/connection.md)
 func Parse(dataSourceName string) (ConnectionParams, error) {
 	P := ConnectionParams{
 		StandaloneConnection: DefaultStandaloneConnection,
@@ -298,11 +372,12 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		// URL
 		u, err := url.Parse(dataSourceName)
 		if err != nil {
-			return P, errors.Errorf("%s: %w", dataSourceName, err)
+			return P, fmt.Errorf("%s: %w", dataSourceName, err)
 		}
 		if usr := u.User; usr != nil {
 			P.Username = usr.Username()
-			P.Password.secret, _ = usr.Password()
+			passw, _ := usr.Password()
+			P.Password.Set(passw)
 		}
 		P.ConnectString = u.Hostname()
 		// IPv6 literal address brackets are removed by u.Hostname,
@@ -325,7 +400,9 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 	} else {
 		// Not URL, not logfmt-ed - an old styled DSN
 		// Old, or Easy Connect, or anything
-		P.Username, P.Password.secret, dataSourceName = parseUserPassw(dataSourceName)
+		var passw string
+		P.Username, passw, dataSourceName = parseUserPassw(dataSourceName)
+		P.Password.Set(passw)
 		//fmt.Printf("dsn=%q\n", dataSourceName)
 		uSid := strings.ToUpper(dataSourceName)
 		//fmt.Printf("dataSourceName=%q SID=%q\n", dataSourceName, uSid)
@@ -345,7 +422,9 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 
 	if paramsString != "" {
 		if q == nil {
-			q = make(url.Values, 32)
+			pa := acquireParamsArray(32)
+			defer releaseParamsArray(pa)
+			q = pa.Values
 		}
 		// Parse the logfmt-formatted parameters string
 		d := logfmt.NewDecoder(strings.NewReader(paramsString))
@@ -357,7 +436,9 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 				case "user":
 					P.Username = value
 				case "password":
-					P.Password.secret = value
+					P.Password.Set(value)
+				case "charset":
+					P.Charset = value
 				case "alterSession", "onInit", "shardingKey", "superShardingKey":
 					q.Add(key, value)
 				default:
@@ -366,7 +447,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 			}
 		}
 		if err := d.Err(); err != nil {
-			return P, errors.Errorf("parsing parameters %q: %w", paramsString, err)
+			return P, fmt.Errorf("parsing parameters %q: %w", paramsString, err)
 		}
 	}
 	//fmt.Printf("cs0=%q\n", P.ConnectString)
@@ -391,6 +472,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		{&P.StandaloneConnection, "standaloneConnection"},
 
 		{&P.NoTZCheck, "noTimezoneCheck"},
+		{&P.InitOnNewConn, "initOnNewConnection"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -398,7 +480,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		}
 		var err error
 		if *task.Dest, err = strconv.ParseBool(s); err != nil {
-			return P, errors.Errorf("%s=%q: %w", task.Key, s, err)
+			return P, fmt.Errorf("%s=%q: %w", task.Key, s, err)
 		}
 		if task.Key == "heterogeneousPool" {
 			P.StandaloneConnection = !P.Heterogeneous
@@ -406,13 +488,14 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 	}
 
 	if tz := q.Get("timezone"); tz != "" {
-		var err error
 		if strings.EqualFold(tz, "local") {
 			P.Timezone = time.Local
 		} else if strings.Contains(tz, "/") {
-			if P.Timezone, err = time.LoadLocation(tz); err != nil {
-				return P, errors.Errorf("%s: %w", tz, err)
+			ptz, err := time.LoadLocation(tz)
+			if err != nil {
+				return P, fmt.Errorf("%s: %w", tz, err)
 			}
+			P.Timezone = ptz
 		} else if off, err := ParseTZ(tz); err == nil {
 			if off == 0 {
 				P.Timezone = time.UTC
@@ -420,21 +503,24 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 				P.Timezone = time.FixedZone(tz, off)
 			}
 		} else {
-			return P, errors.Errorf("%s: %w", tz, err)
+			return P, fmt.Errorf("%s: %w", tz, err)
 		}
 		if P.Timezone == nil {
 			P.Timezone = time.UTC
 		}
+		//} else if P.Timezone == nil {
+		//P.Timezone = time.Local
 	}
-
 	for _, task := range []struct {
 		Dest *int
 		Key  string
 	}{
 		{&P.MinSessions, "poolMinSessions"},
 		{&P.MaxSessions, "poolMaxSessions"},
+		{&P.MaxSessionsPerShard, "poolMasSessionsPerShard"},
 		{&P.SessionIncrement, "poolIncrement"},
 		{&P.SessionIncrement, "sessionIncrement"},
+		{&P.StmtCacheSize, "stmtCacheSize"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -443,9 +529,10 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		var err error
 		*task.Dest, err = strconv.Atoi(s)
 		if err != nil {
-			return P, errors.Errorf("%s: %w", task.Key+"="+s, err)
+			return P, fmt.Errorf("%s: %w", task.Key+"="+s, err)
 		}
 	}
+
 	for _, task := range []struct {
 		Dest *time.Duration
 		Key  string
@@ -453,6 +540,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		{&P.SessionTimeout, "poolSessionTimeout"},
 		{&P.WaitTimeout, "poolWaitTimeout"},
 		{&P.MaxLifeTime, "poolSessionMaxLifetime"},
+		{&P.PingInterval, "pingInterval"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -462,11 +550,11 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		*task.Dest, err = time.ParseDuration(s)
 		if err != nil {
 			if !strings.Contains(err.Error(), "time: missing unit in duration") {
-				return P, errors.Errorf("%s: %w", task.Key+"="+s, err)
+				return P, fmt.Errorf("%s: %w", task.Key+"="+s, err)
 			}
 			i, err := strconv.Atoi(s)
 			if err != nil {
-				return P, errors.Errorf("%s: %w", task.Key+"="+s, err)
+				return P, fmt.Errorf("%s: %w", task.Key+"="+s, err)
 			}
 			base := time.Second
 			if task.Key == "poolWaitTimeout" {
@@ -491,14 +579,14 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 			}
 		}
 		if err := d.Err(); err != nil {
-			return P, errors.Errorf("%q: %w", s, err)
+			return P, fmt.Errorf("%q: %w", s, err)
 		}
 	}
 	P.OnInitStmts = q["onInit"]
 	P.ShardingKey = strToIntf(q["shardingKey"])
 	P.SuperShardingKey = strToIntf(q["superShardingKey"])
 
-	P.NewPassword.secret = q.Get("newPassword")
+	P.NewPassword.Set(q.Get("newPassword"))
 	P.ConfigDir = q.Get("configDir")
 	P.LibDir = q.Get("libDir")
 
@@ -516,17 +604,16 @@ type Password struct {
 }
 
 // NewPassword creates a new Password, containing the given secret.
-func NewPassword(secret string) Password { return Password{secret: secret} }
+func NewPassword(secret string) Password {
+	var P Password
+	P.Set(secret)
+	return P
+}
+
+const obfuscatedPassword = "SECRET-***"
 
 // String returns the secret obfuscated irreversibly.
-func (P Password) String() string {
-	if P.secret == "" {
-		return ""
-	}
-	hsh := fnv.New64()
-	io.WriteString(hsh, P.secret)
-	return "SECRET-" + base64.URLEncoding.EncodeToString(hsh.Sum(nil))
-}
+func (P Password) String() string { return obfuscatedPassword }
 
 // Secret reveals the real password.
 func (P Password) Secret() string { return P.secret }
@@ -541,10 +628,26 @@ func (P Password) Len() int { return len(P.secret) }
 func (P *Password) Reset() { P.secret = "" }
 
 // Set the password.
-func (P *Password) Set(secret string) { P.secret = secret }
+func (P *Password) Set(secret string) {
+	P.secret = secret
+}
+
+// LogValue implements slog.LogValuer.
+func (P Password) LogValue() slog.Value { return slog.StringValue(obfuscatedPassword) }
+
+var ErrCannotMarshal = errors.New("cannot be marshaled")
+
+func (P *Password) MarshalText() ([]byte, error) { return nil, ErrCannotMarshal }
+
+// nosemgrep
+func (P *Password) MarshalJSON() ([]byte, error)   { return nil, ErrCannotMarshal }
+func (P *Password) MarshalBinary() ([]byte, error) { return nil, ErrCannotMarshal }
+
+var _ encoding.TextMarshaler = ((*Password)(nil))
+var _ encoding.BinaryMarshaler = ((*Password)(nil))
 
 // CopyFrom another password.
-func (P *Password) CopyFrom(Q Password) { P.secret = Q.secret }
+func (P *Password) CopyFrom(Q Password) { *P = Q }
 
 // ParamsArray is an url.Values for holding parameters,
 // and logfmt-formatting them with the String() method.
@@ -552,15 +655,36 @@ type paramsArray struct {
 	url.Values
 }
 
+var paramsArrayPool8 = sync.Pool{New: func() any { return newParamsArray(8) }}
+var paramsArrayPool32 = sync.Pool{New: func() any { return newParamsArray(32) }}
+
+func acquireParamsArray(cap int) *paramsArray {
+	if cap <= 8 {
+		return paramsArrayPool8.Get().(*paramsArray)
+	}
+	return paramsArrayPool32.Get().(*paramsArray)
+}
+func releaseParamsArray(p *paramsArray) {
+	length := len(p.Values)
+	for k := range p.Values {
+		delete(p.Values, k)
+	}
+	if length < 32 {
+		paramsArrayPool8.Put(p)
+	} else {
+		paramsArrayPool32.Put(p)
+	}
+}
+
 // newParamsArray returns a new paramsArray with the given capacity of parameters.
 //
 // You can use this to build a dataSourceName for godror.
-func newParamsArray(cap int) paramsArray { return paramsArray{Values: make(url.Values, cap)} }
+func newParamsArray(cap int) *paramsArray { return &paramsArray{Values: make(url.Values, cap)} }
 
 // WriteTo the given writer, logfmt-encoded,
 // starting with username, password, connectString,
 // then the rest sorted alphabetically.
-func (p paramsArray) WriteTo(w io.Writer) (int64, error) {
+func (p *paramsArray) WriteTo(w io.Writer) (int64, error) {
 	firstKeys := make([]string, 0, len(p.Values))
 	keys := make([]string, 0, len(p.Values))
 	for k := range p.Values {
@@ -605,10 +729,13 @@ func (p paramsArray) WriteTo(w io.Writer) (int64, error) {
 	return cw.N, firstErr
 }
 
+var paSB = sync.Pool{New: func() any { return new(strings.Builder) }}
+
 // String returns the values in the params array, logfmt-formatted,
 // starting with username, password, connectString, then the rest sorted alphabetically.
-func (p paramsArray) String() string {
-	var buf strings.Builder
+func (p *paramsArray) String() string {
+	buf := paSB.Get().(*strings.Builder)
+	defer func() { buf.Reset(); paSB.Put(buf) }()
 	var n int
 	for k, vv := range p.Values {
 		for _, v := range vv {
@@ -616,39 +743,26 @@ func (p paramsArray) String() string {
 		}
 	}
 	buf.Grow(n)
-	if _, err := p.WriteTo(&buf); err != nil {
-		fmt.Fprintf(&buf, "\tERROR: %+v", err)
+	if _, err := p.WriteTo(buf); err != nil {
+		fmt.Fprintf(buf, "\tERROR: %+v", err)
 	}
 	return buf.String()
 }
-func (p paramsArray) Reset() {
+func (p *paramsArray) Reset() {
 	for k := range p.Values {
 		delete(p.Values, k)
 	}
 }
 
-/*
-func quoteRunes(s, runes string) string {
-	if !strings.ContainsAny(s, runes) {
-		return s
-	}
-	var buf strings.Builder
-	buf.Grow(2 * len(s))
-	for _, r := range s {
-		if strings.ContainsRune(runes, r) {
-			buf.WriteByte('\\')
-		}
-		buf.WriteRune(r)
-	}
-	return buf.String()
-}
-*/
+var unquoteSB = sync.Pool{New: func() any { return new(strings.Builder) }}
+
 // unquote replaces quoted ("\\n") with the quoted.
 func unquote(s string) string {
 	if !strings.ContainsRune(s, '\\') {
 		return s
 	}
-	var buf strings.Builder
+	buf := unquoteSB.Get().(*strings.Builder)
+	defer func() { buf.Reset(); unquoteSB.Put(buf) }()
 	buf.Grow(len(s))
 	var quoted bool
 	for _, r := range s {
@@ -739,11 +853,11 @@ func ParseTZ(s string) (int, error) {
 	var tz int
 	var ok bool
 	if i := strings.IndexByte(s, ':'); i >= 0 {
-		i64, err := strconv.ParseInt(s[i+1:], 10, 6)
+		u64, err := strconv.ParseUint(s[i+1:], 10, 6)
 		if err != nil {
-			return tz, errors.Errorf("%s: %w", s, err)
+			return tz, fmt.Errorf("%s: %w", s, err)
 		}
-		tz = int(i64 * 60)
+		tz = int(u64 * 60)
 		s = s[:i]
 		ok = true
 	}
@@ -751,7 +865,7 @@ func ParseTZ(s string) (int, error) {
 		if i := strings.IndexByte(s, '/'); i >= 0 {
 			targetLoc, err := time.LoadLocation(s)
 			if err != nil {
-				return tz, errors.Errorf("%s: %w", s, err)
+				return tz, fmt.Errorf("%s: %w", s, err)
 			}
 			if targetLoc == nil {
 				targetLoc = time.UTC
@@ -765,7 +879,7 @@ func ParseTZ(s string) (int, error) {
 	}
 	i64, err := strconv.ParseInt(s, 10, 5)
 	if err != nil {
-		return tz, errors.Errorf("%s: %w", s, err)
+		return tz, fmt.Errorf("%s: %w", s, err)
 	}
 	if i64 < 0 {
 		tz = -tz

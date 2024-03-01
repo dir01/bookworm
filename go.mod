@@ -6,7 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/jmoiron/sqlx v1.3.5
 	github.com/mattn/go-sqlite3 v1.14.21
-	github.com/rubenv/sql-migrate v1.5.2
+	github.com/rubenv/sql-migrate v1.6.1
 	github.com/tamerh/xml-stream-parser v1.4.0
 	gopkg.in/telebot.v3 v3.2.1
 )
@@ -21,9 +21,10 @@ require (
 	github.com/denisenkom/go-mssqldb v0.9.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-gorp/gorp/v3 v3.1.0 // indirect
-	github.com/go-logfmt/logfmt v0.5.0 // indirect
+	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-sql-driver/mysql v1.6.0 // indirect
-	github.com/godror/godror v0.24.2 // indirect
+	github.com/godror/godror v0.40.4 // indirect
+	github.com/godror/knownpb v0.1.1 // indirect
 	github.com/golang-sql/civil v0.0.0-20190719163853-cb61b32ac6fe // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -43,8 +44,9 @@ require (
 	github.com/shopspring/decimal v1.3.1 // indirect
 	github.com/spf13/cast v1.5.0 // indirect
 	github.com/tamerh/xpath v1.0.0 // indirect
-	golang.org/x/crypto v0.5.0 // indirect
-	golang.org/x/sys v0.5.0 // indirect
-	golang.org/x/xerrors v0.0.0-20220517211312-f3a8303e98df // indirect
+	golang.org/x/crypto v0.17.0 // indirect
+	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
+	golang.org/x/sys v0.15.0 // indirect
+	google.golang.org/protobuf v1.30.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )

@@ -1,4 +1,4 @@
-// Copyright 2019, 2020 The Godror Authors
+// Copyright 2019, 2023 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -8,29 +8,34 @@
 // The connection string for the sql.Open("godror", dataSourceName) call can be
 // the simple
 //
-//   user="login" password="password" connectString="host:port/service_name" sysdba=true
+//	user="login" password="password" connectString="host:port/service_name" sysdba=true
 //
 // with additional params (here with the defaults):
-//     sysdba=0
-//     sysoper=0
-//     poolMinSessions=1
-//     poolMaxSessions=1000
-//     poolIncrement=1
-//     connectionClass=
-//     standaloneConnection=0
-//     enableEvents=0
-//     heterogeneousPool=0
-//     externalAuth=0
-//     prelim=0
-//     poolWaitTimeout=5m
-//     poolSessionMaxLifetime=1h
-//     poolSessionTimeout=30s
-//     timezone=
-//     noTimezoneCheck=
-//     newPassword=
-//     onInit="ALTER SESSION SET current_schema=my_schema"
-//     configDir=
-//     libDir=
+//
+//	sysdba=0
+//	sysoper=0
+//	poolMinSessions=1
+//	poolMaxSessions=1000
+//	poolMaxSessionsPerShard=
+//	poolPingInterval=
+//	poolIncrement=1
+//	connectionClass=
+//	standaloneConnection=0
+//	enableEvents=0
+//	heterogeneousPool=0
+//	externalAuth=0
+//	prelim=0
+//	poolWaitTimeout=5m
+//	poolSessionMaxLifetime=1h
+//	poolSessionTimeout=30s
+//	timezone=
+//	noTimezoneCheck=
+//	newPassword=
+//	onInit="ALTER SESSION SET current_schema=my_schema"
+//	configDir=
+//	libDir=
+//	stmtCacheSize=
+//	charset=UTF-8
 //
 // These are the defaults.
 // For external authentication, user and password should be empty
@@ -57,31 +62,35 @@
 //
 // If you specify server_type as POOLED in sid, DRCP is used.
 // For what can be used as "sid", see https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-E5358DEA-D619-4B7B-A799-3D2F802500F1
+//
+// Go strings are UTF-8, so the default charset should be used unless there's a really good reason to interfere with Oracle's character set conversion.
 package godror
 
 /*
 #cgo CFLAGS: -I./odpi/include -I./odpi/src -I./odpi/embed
 
 #include "dpi.c"
+
 */
 import "C"
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/godror/godror/slog"
 	"io"
 	"math"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
-
-	"github.com/go-logfmt/logfmt"
 
 	"github.com/godror/godror/dsn"
 )
@@ -97,6 +106,11 @@ const (
 	DefaultArraySize = 1 << 10
 )
 
+// DriverName is set on the connection to be seen in the DB
+//
+// It cannot be longer than 30 bytes !
+var DriverName = "godror : " + Version
+
 const (
 	// DpiMajorVersion is the wanted major version of the underlying ODPI-C library.
 	DpiMajorVersion = C.DPI_MAJOR_VERSION
@@ -106,11 +120,6 @@ const (
 	DpiPatchLevel = C.DPI_PATCH_LEVEL
 	// DpiVersionNumber is the underlying ODPI-C version as one number (Major * 10000 + Minor * 100 + Patch)
 	DpiVersionNumber = C.DPI_VERSION_NUMBER
-
-	// DriverName is set on the connection to be seen in the DB
-	//
-	// It cannot be longer than 30 bytes !
-	DriverName = "godror : " + Version
 
 	// DefaultPoolMinSessions specifies the default value for minSessions for pool creation.
 	DefaultPoolMinSessions = dsn.DefaultPoolMinSessions
@@ -154,28 +163,14 @@ func ParseDSN(dataSourceName string) (P ConnectionParams, err error) {
 
 func NewPassword(s string) Password { return dsn.NewPassword(s) }
 
-// Log function. By default, it's nil, and thus logs nothing.
-// If you want to change this, change it to a github.com/go-kit/kit/log.Swapper.Log
-// or analog to be race-free.
-var Log func(...interface{}) error
-
-// NewLogfmtLog returns a function that can be used as the Log variable,
-// and that logs using logfmt, to the given io.Writer.
-func NewLogfmtLog(w io.Writer) func(...interface{}) error {
-	enc := logfmt.NewEncoder(w)
-	return func(keyvals ...interface{}) error {
-		firstErr := enc.EncodeKeyvals(keyvals...)
-		if err := enc.EndRecord(); err != nil && firstErr == nil {
-			return err
-		}
-		return firstErr
-	}
-}
-
 var defaultDrv = &drv{}
 
 func init() {
 	sql.Register("godror", defaultDrv)
+	// It cannot be longer than 30 bytes !
+	if len(DriverName) > 30 {
+		DriverName = DriverName[:30]
+	}
 }
 
 var _ driver.Driver = (*drv)(nil)
@@ -188,13 +183,7 @@ type drv struct {
 	mu            sync.RWMutex
 }
 
-func NewDriver() *drv {
-	if defaultDrv == nil {
-		return &drv{}
-	}
-	// Use one global dpiContext - see https://github.com/golang/go/issues/43977
-	return &drv{dpiContext: defaultDrv.dpiContext}
-}
+func NewDriver() *drv { return &drv{} }
 func (d *drv) Close() error {
 	if d == nil {
 		return nil
@@ -203,14 +192,30 @@ func (d *drv) Close() error {
 	defer d.mu.Unlock()
 	dpiCtx, pools := d.dpiContext, d.pools
 	d.dpiContext, d.pools, d.timezones = nil, nil, nil
-	for _, pool := range pools {
-		pool.Close()
+	done := make(chan error, 1)
+	go func() {
+		for _, pool := range pools {
+			pool.Purge()
+		}
+		done <- nil
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
 	}
-	// As we use one global dpiContext, don't destroy it
-	if dpiCtx != nil && !(d != defaultDrv && defaultDrv.dpiContext == dpiCtx) {
-		C.dpiContext_destroy(dpiCtx)
+
+	go func() {
+		if C.dpiContext_destroy(dpiCtx) == C.DPI_FAILURE {
+			done <- fmt.Errorf("error destroying dpiContext %p", dpiCtx)
+		}
+		close(done)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("Driver.Close: %w", context.DeadlineExceeded)
 	}
-	return nil
 }
 
 type locationWithOffSecs struct {
@@ -221,6 +226,15 @@ type connPool struct {
 	dpiPool *C.dpiPool
 	key     string
 	params  commonAndPoolParams
+}
+
+// Purge force-closes the pool's connections then closes the pool.
+func (p *connPool) Purge() {
+	dpiPool := p.dpiPool
+	p.dpiPool = nil
+	if dpiPool != nil {
+		C.dpiPool_close(dpiPool, C.DPI_MODE_POOL_CLOSE_FORCE)
+	}
 }
 
 func (p *connPool) Close() error {
@@ -234,7 +248,12 @@ func (p *connPool) Close() error {
 
 func (d *drv) checkExec(f func() C.int) error {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	err := d.checkExecNoLOT(f)
+	runtime.UnlockOSThread()
+	return err
+}
+
+func (d *drv) checkExecNoLOT(f func() C.int) error {
 	if f() != C.DPI_FAILURE {
 		return nil
 	}
@@ -242,6 +261,12 @@ func (d *drv) checkExec(f func() C.int) error {
 }
 
 func (d *drv) init(configDir, libDir string) error {
+	d.mu.RLock()
+	ok := d.pools != nil && d.timezones != nil && d.dpiContext != nil
+	d.mu.RUnlock()
+	if ok {
+		return nil
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.pools == nil {
@@ -263,8 +288,9 @@ func (d *drv) init(configDir, libDir string) error {
 			ctxParams.oracleClientLibDir = C.CString(libDir)
 		}
 	}
-	if Log != nil {
-		Log("msg", "dpiContext_createWithParams", "params", ctxParams)
+	logger := getLogger(context.TODO())
+	if logger != nil {
+		logger.Debug("dpiContext_createWithParams", "params", ctxParams)
 	}
 
 	runtime.LockOSThread()
@@ -280,7 +306,7 @@ func (d *drv) init(configDir, libDir string) error {
 
 	var v C.dpiVersionInfo
 	if C.dpiContext_getClientVersion(d.dpiContext, &v) == C.DPI_FAILURE {
-		return fmt.Errorf("%s: %w", "getClientVersion", d.getError())
+		return fmt.Errorf("getClientVersion: %w", d.getError())
 	}
 	d.clientVersion.set(&v)
 	return nil
@@ -293,7 +319,7 @@ func (d *drv) Open(s string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return d.createConnFromParams(c.(connector).ConnectionParams)
+	return d.createConnFromParams(context.Background(), c.(connector).ConnectionParams)
 }
 
 func (d *drv) ClientVersion() (VersionInfo, error) {
@@ -306,7 +332,7 @@ var cUTF8, cDriverName = C.CString("UTF-8"), C.CString(DriverName)
 // initCommonCreateParams initializes ODPI-C common creation parameters used for creating pools and
 // standalone connections. The C strings for the encoding and driver name are
 // defined at the package level for convenience.
-func (d *drv) initCommonCreateParams(P *C.dpiCommonCreateParams, enableEvents bool) error {
+func (d *drv) initCommonCreateParams(P *C.dpiCommonCreateParams, enableEvents bool, stmtCacheSize int, charset string) error {
 	// initialize ODPI-C structure for common creation parameters
 	if err := d.checkExec(func() C.int {
 		return C.dpiContext_initCommonCreateParams(d.dpiContext, P)
@@ -314,9 +340,12 @@ func (d *drv) initCommonCreateParams(P *C.dpiCommonCreateParams, enableEvents bo
 		return fmt.Errorf("initCommonCreateParams: %w", err)
 	}
 
-	// assign encoding and national encoding (always use UTF-8)
-	P.encoding = cUTF8
-	P.nencoding = cUTF8
+	// assign encoding and national encoding
+	P.encoding, P.nencoding = cUTF8, cUTF8
+	if charset != "" {
+		P.encoding = C.CString(charset)
+		P.nencoding = P.encoding
+	}
 
 	// assign driver name
 	P.driverName = cDriverName
@@ -329,6 +358,13 @@ func (d *drv) initCommonCreateParams(P *C.dpiCommonCreateParams, enableEvents bo
 	if enableEvents {
 		P.createMode |= C.DPI_MODE_CREATE_EVENTS
 	}
+	if stmtCacheSize != 0 {
+		if stmtCacheSize < 0 {
+			P.stmtCacheSize = 0
+		} else {
+			P.stmtCacheSize = C.uint32_t(stmtCacheSize)
+		}
+	}
 
 	return nil
 }
@@ -336,15 +372,16 @@ func (d *drv) initCommonCreateParams(P *C.dpiCommonCreateParams, enableEvents bo
 // createConn creates an ODPI-C connection with the specified parameters. If a pool is
 // provided, the connection is acquired from the pool; otherwise, a standalone
 // connection is created.
-func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, error) {
+// second return value: true = connection is new / false = connection is from pool
+func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, bool, error) {
 	// initialize driver, if necessary
 	if err := d.init(P.ConfigDir, P.LibDir); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	dc, newSession, err := d.acquireConn(pool, P)
+	dc, isNew, cleanup, err := d.acquireConn(pool, P)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var poolKey string
 	if pool != nil {
@@ -353,9 +390,9 @@ func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, error) {
 	// create connection and initialize it, if needed
 	c := conn{
 		drv: d, dpiConn: dc,
-		params:     dsn.ConnectionParams{CommonParams: P.CommonParams, ConnParams: P.ConnParams},
-		newSession: pool == nil || newSession,
-		poolKey:    poolKey,
+		params:   dsn.ConnectionParams{CommonParams: P.CommonParams, ConnParams: P.ConnParams},
+		poolKey:  poolKey,
+		objTypes: make(map[string]*ObjectType),
 	}
 	if pool != nil {
 		c.params.PoolParams = pool.params.PoolParams
@@ -363,35 +400,63 @@ func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, error) {
 			c.params.Username = pool.params.Username
 		}
 	}
-	c.init(getOnInit(&P.CommonParams))
-
-	var a [4096]byte
-	stack := a[:runtime.Stack(a[:], false)]
-	runtime.SetFinalizer(&c, func(c *conn) {
-		if c != nil && c.dpiConn != nil {
-			fmt.Printf("ERROR: conn %p of createConn is not Closed!\n%s\n", c, stack)
-			c.closeNotLocking()
+	ctx, cancel := context.WithTimeout(context.Background(), nvlD(c.params.WaitTimeout, time.Minute))
+	err = c.init(ctx, isNew, getOnInit(&c.params.CommonParams))
+	cancel()
+	if err != nil {
+		_ = c.closeNotLocking()
+		if cleanup != nil {
+			cleanup()
 		}
-	})
-	return &c, nil
+		return nil, false, err
+	}
+
+	if !guardWithFinalizers.Load() {
+		return &c, isNew, nil
+	}
+
+	if !logLingeringResourceStack.Load() {
+		runtime.SetFinalizer(&c, func(c *conn) {
+			if cleanup != nil {
+				cleanup()
+			}
+			if c != nil && c.dpiConn != nil {
+				fmt.Printf("ERROR: conn %p of createConn is not Closed!\n", c)
+				_ = c.closeNotLocking()
+			}
+		})
+	} else {
+		var a [4096]byte
+		stack := a[:runtime.Stack(a[:], false)]
+		runtime.SetFinalizer(&c, func(c *conn) {
+			if cleanup != nil {
+				cleanup()
+			}
+			if c != nil && c.dpiConn != nil {
+				fmt.Printf("ERROR: conn %p of createConn is not Closed!\n%s\n", c, stack)
+				_ = c.closeNotLocking()
+			}
+		})
+	}
+	return &c, isNew, nil
 }
 
-func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bool, error) {
-	if Log != nil {
-		Log("msg", "acquireConn", "pool", pool, "connParams", P)
+func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bool, func(), error) {
+	logger := P.Logger
+	if logger != nil {
+		logger.Debug("acquireConn", "pool", pool, "connParams", P)
 	}
 	// initialize ODPI-C structure for common creation parameters; this is only
 	// used when a standalone connection is being created; when a connection is
 	// being acquired from the pool this structure is not needed
 	var commonCreateParamsPtr *C.dpiCommonCreateParams
-	var commonCreateParams C.dpiCommonCreateParams
 	if pool == nil {
-		if err := d.initCommonCreateParams(&commonCreateParams, P.EnableEvents); err != nil {
-			return nil, false, err
+		var commonCreateParams C.dpiCommonCreateParams
+		if err := d.initCommonCreateParams(&commonCreateParams, P.EnableEvents, P.StmtCacheSize, P.Charset); err != nil {
+			return nil, false, nil, err
 		}
 		commonCreateParamsPtr = &commonCreateParams
 	}
-
 	// manage strings
 	var cUsername, cPassword, cNewPassword, cConnectString, cConnClass *C.char
 	defer func() {
@@ -417,7 +482,7 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 	if err := d.checkExec(func() C.int {
 		return C.dpiContext_initConnCreateParams(d.dpiContext, &connCreateParams)
 	}); err != nil {
-		return nil, false, fmt.Errorf("initConnCreateParams: %w", err)
+		return nil, false, nil, fmt.Errorf("initConnCreateParams: %w", err)
 	}
 
 	// assign connection class
@@ -455,6 +520,7 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 		connCreateParams.authMode |= C.DPI_MODE_AUTH_PRELIM
 	}
 
+	var cleanup func()
 	// assign sharding keys, if applicable
 	if len(P.ShardingKey) > 0 {
 		var tempData C.dpiData
@@ -482,19 +548,21 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 				tbd = append(tbd, func() { C.free(unsafe.Pointer(cs)) })
 				C.dpiData_setBytes(&tempData, cs, C.uint32_t(len(value)))
 			default:
-				return nil, false, errors.New("unsupported data type for sharding")
+				for _, f := range tbd {
+					f()
+				}
+				return nil, false, nil, errors.New("unsupported data type for sharding")
 			}
 			columns[i].value = tempData.value
 		}
 		connCreateParams.shardingKeyColumns = &columns[0]
 		connCreateParams.numShardingKeyColumns = C.uint8_t(len(P.ShardingKey))
 		if len(tbd) != 0 {
-			runtime.SetFinalizer(connCreateParams.shardingKeyColumns,
-				func(_ interface{}) {
-					for _, f := range tbd {
-						f()
-					}
-				})
+			cleanup = func() {
+				for _, f := range tbd {
+					f()
+				}
+			}
 		}
 	}
 
@@ -531,15 +599,20 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 			&connCreateParams, &dc,
 		)
 	}); err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
 		if pool != nil {
 			stats, _ := d.getPoolStats(pool)
-			return nil, false, fmt.Errorf("user=%q ConnectString=%q stats=%s params=%+v: %w",
-				username, P.ConnectString, stats, connCreateParams, err)
+			return nil, false, nil, fmt.Errorf("pool=%p stats=%s params=%+v: %w",
+				pool.dpiPool, stats, connCreateParams, err)
 		}
-		return nil, false, fmt.Errorf("user=%q ConnectString=%q standalone params=%+v: %w",
-			username, P.ConnectString, connCreateParams, err)
+		return nil, false, nil, fmt.Errorf("user=%q standalone params=%+v: %w",
+			username, connCreateParams, err)
 	}
-	return dc, connCreateParams.outNewSession == 1, nil
+	//use the information from ODPI driver if new connection has been created or it is only pooled
+	isNew := connCreateParams.outNewSession == 1
+	return dc, isNew, cleanup, nil
 }
 
 // createConnFromParams creates a driver connection given pool parameters and connection
@@ -550,7 +623,7 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 // standalone connection is created instead. The connection parameters are used
 // to acquire a connection from the pool specified by the pool parameters or
 // are used to create a standalone connection.
-func (d *drv) createConnFromParams(P dsn.ConnectionParams) (*conn, error) {
+func (d *drv) createConnFromParams(ctx context.Context, P dsn.ConnectionParams) (*conn, error) {
 	var err error
 	var pool *connPool
 	if !P.IsStandalone() {
@@ -559,15 +632,23 @@ func (d *drv) createConnFromParams(P dsn.ConnectionParams) (*conn, error) {
 			return nil, err
 		}
 	}
-	conn, err := d.createConn(pool, commonAndConnParams{CommonParams: P.CommonParams, ConnParams: P.ConnParams})
+	conn, isNew, err := d.createConn(pool, commonAndConnParams{CommonParams: P.CommonParams, ConnParams: P.ConnParams})
 	if err != nil {
 		return conn, err
 	}
-	onInit := getOnInit(&P.CommonParams)
+
+	if P.CommonParams.InitOnNewConn && !isNew {
+		return conn, nil
+	}
+
+	onInit := getOnInit(&conn.params.CommonParams)
 	if onInit == nil {
 		return conn, err
 	}
-	if err = onInit(conn); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, nvlD(conn.params.WaitTimeout, time.Minute))
+	err = onInit(ctx, conn)
+	cancel()
+	if err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -585,19 +666,22 @@ func (d *drv) getPool(P commonAndPoolParams) (*connPool, error) {
 	}
 
 	var usernameKey string
+	var passwordHash [sha256.Size]byte
 	if !P.Heterogeneous && !P.ExternalAuth {
 		// skip username being part of key in heterogeneous pools
 		usernameKey = P.Username
+		passwordHash = sha256.Sum256([]byte(P.Password.Secret())) // See issue #245
 	}
 	// determine key to use for pool
-	poolKey := fmt.Sprintf("%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%t\t%t\t%t\t%s",
-		usernameKey, P.ConnectString, P.MinSessions, P.MaxSessions,
+	poolKey := fmt.Sprintf("%s\t%x\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%t\t%t\t%t\t%s\t%d\t%s",
+		usernameKey, passwordHash[:4], P.ConnectString, P.MinSessions, P.MaxSessions,
 		P.SessionIncrement, P.WaitTimeout, P.MaxLifeTime, P.SessionTimeout,
 		P.Heterogeneous, P.EnableEvents, P.ExternalAuth,
-		P.Timezone,
+		P.Timezone, P.MaxSessionsPerShard, P.PingInterval,
 	)
-	if Log != nil {
-		Log("msg", "getPool", "key", poolKey)
+	logger := P.Logger
+	if logger != nil {
+		logger.Debug("getPool", "key", poolKey)
 	}
 
 	// if pool already exists, return it immediately; otherwise, create a new
@@ -610,14 +694,18 @@ func (d *drv) getPool(P commonAndPoolParams) (*connPool, error) {
 	if ok {
 		return pool, nil
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if pool, ok = d.pools[poolKey]; ok {
-		return pool, nil
-	}
+	// createPool uses checkExec wich needs getError which uses RLock,
+	// so we cannot Lock here, thus this little race window for
+	// creating a pool and throwing it away.
 	pool, err := d.createPool(P)
 	if err != nil {
 		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if poolOld, ok := d.pools[poolKey]; ok {
+		_ = pool.Close()
+		return poolOld, nil
 	}
 	pool.key = poolKey
 	d.pools[poolKey] = pool
@@ -632,7 +720,7 @@ func (d *drv) createPool(P commonAndPoolParams) (*connPool, error) {
 
 	// set up common creation parameters
 	var commonCreateParams C.dpiCommonCreateParams
-	if err := d.initCommonCreateParams(&commonCreateParams, P.EnableEvents); err != nil {
+	if err := d.initCommonCreateParams(&commonCreateParams, P.EnableEvents, P.StmtCacheSize, P.Charset); err != nil {
 		return nil, err
 	}
 
@@ -711,10 +799,13 @@ func (d *drv) createPool(P commonAndPoolParams) (*connPool, error) {
 
 	// create pool
 	var dp *C.dpiPool
-	if Log != nil {
-		Log("C", "dpiPool_create", "user", P.Username, "ConnectString", P.ConnectString,
-			"common", commonCreateParams, "pool",
-			fmt.Sprintf("%#v", poolCreateParams))
+	logger := P.Logger
+	if logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+		logger.Debug("C.dpiPool_create",
+			"user", P.Username,
+			"ConnectString", P.ConnectString,
+			"common", commonCreateParams,
+			"pool", fmt.Sprintf("%#v", poolCreateParams))
 	}
 	if err := d.checkExec(func() C.int {
 		return C.dpiPool_create(
@@ -727,11 +818,20 @@ func (d *drv) createPool(P commonAndPoolParams) (*connPool, error) {
 			(**C.dpiPool)(unsafe.Pointer(&dp)),
 		)
 	}); err != nil {
-		return nil, fmt.Errorf("params=%s extAuth=%v: %w", P, poolCreateParams.externalAuth, err)
+		return nil, fmt.Errorf("dpoPool_create user=%s extAuth=%v: %w",
+			P.Username, poolCreateParams.externalAuth, err)
 	}
 
 	// set statement cache
-	C.dpiPool_setStmtCacheSize(dp, 40)
+	stmtCacheSize := C.uint32_t(40)
+	if P.StmtCacheSize != 0 {
+		if P.StmtCacheSize < 0 {
+			stmtCacheSize = 0
+		} else {
+			stmtCacheSize = C.uint32_t(P.StmtCacheSize)
+		}
+	}
+	C.dpiPool_setStmtCacheSize(dp, stmtCacheSize)
 
 	return &connPool{dpiPool: dp, params: P}, nil
 }
@@ -745,6 +845,15 @@ type PoolStats struct {
 func (s PoolStats) String() string {
 	return fmt.Sprintf("busy=%d open=%d max=%d maxLifetime=%s timeout=%s waitTimeout=%s",
 		s.Busy, s.Open, s.Max, s.MaxLifetime, s.Timeout, s.WaitTimeout)
+}
+func (p PoolStats) AsDBStats() sql.DBStats {
+	return sql.DBStats{
+		MaxOpenConnections: int(p.Max),
+		// Pool Status
+		OpenConnections: int(p.Open),
+		InUse:           int(p.Busy),
+		Idle:            int(p.Open) - int(p.Busy),
+	}
 }
 
 // Stats returns PoolStats of the pool.
@@ -850,10 +959,29 @@ func fromErrorInfo(errInfo C.dpiErrorInfo) error {
 	if oe.code == 0 && oe.message == "" {
 		return nil
 	}
-	if oe.code == 0 && strings.HasPrefix(oe.message, "ORA-") &&
-		len(oe.message) > 9 && oe.message[9] == ':' {
-		if i, _ := strconv.Atoi(oe.message[4:9]); i > 0 {
-			oe.code, oe.message = i, strings.TrimSpace(oe.message[10:])
+	indexNotDigit := func(s string) int {
+		return strings.IndexFunc(s, func(r rune) bool {
+			return !('0' <= r && r <= '9')
+		})
+	}
+	if oe.code == 0 {
+		if msg, ok := stringsCutPrefix(oe.message, "ORA-"); ok {
+			if i := indexNotDigit(msg); i > 0 && msg[i] == ':' {
+				if j, _ := strconv.Atoi(msg[:i]); j > 0 {
+					oe.code, oe.message = j, strings.TrimSpace(msg[i+1:])
+				}
+			}
+		}
+	}
+	if oe.code == 0 {
+		// DPI-1080: connection was closed by ORA-3113
+		if msg, num, ok := stringsCut(oe.message, " ORA-"); ok {
+			if j := indexNotDigit(num); j > 0 {
+				num, msg = num[:j], msg+" "+num[j:]
+			}
+			if j, _ := strconv.Atoi(num); j > 0 {
+				oe.code, oe.message = j, strings.TrimSpace(msg)
+			}
 		}
 	}
 	oe.message = strings.TrimPrefix(oe.message, fmt.Sprintf("ORA-%05d: ", oe.Code()))
@@ -886,14 +1014,20 @@ func newErrorInfo(code int, message string) C.dpiErrorInfo {
 var _ = newErrorInfo
 
 func (d *drv) getError() error {
-	if d == nil || d.dpiContext == nil {
-		return &OraErr{code: -12153, message: driver.ErrBadConn.Error()}
+	if d == nil {
+		return &OraErr{code: 12153, message: "getError on nil drv: " + driver.ErrBadConn.Error()}
+	}
+	d.mu.RLock()
+	dpiContext := d.dpiContext
+	d.mu.RUnlock()
+
+	if dpiContext == nil {
+		return &OraErr{code: 12153, message: "getError on in dpiContext: " + driver.ErrBadConn.Error()}
 	}
 	var errInfo C.dpiErrorInfo
-	C.dpiContext_getError(d.dpiContext, &errInfo)
+	C.dpiContext_getError(dpiContext, &errInfo)
 	return fromErrorInfo(errInfo)
 }
-
 func b2i(b bool) uint8 {
 	if b {
 		return 1
@@ -915,7 +1049,7 @@ func (V *VersionInfo) set(v *C.dpiVersionInfo) {
 		Full: uint8(v.fullVersionNum),
 	}
 }
-func (V VersionInfo) String() string {
+func (V *VersionInfo) String() string {
 	var s string
 	if V.ServerRelease != "" {
 		s = " [" + V.ServerRelease + "]"
@@ -962,24 +1096,9 @@ func timeZoneFor(hourOffset, minuteOffset C.int8_t, local *time.Location) *time.
 	return tz
 }
 
-type logCtxKey struct{}
-
-type logFunc func(...interface{}) error
-
-func ctxGetLog(ctx context.Context) logFunc {
-	if lgr, ok := ctx.Value(logCtxKey{}).(func(...interface{}) error); ok {
-		return lgr
-	}
-	return Log
-}
-
-// ContextWithLog returns a context with the given log function.
-func ContextWithLog(ctx context.Context, logF func(...interface{}) error) context.Context {
-	return context.WithValue(ctx, logCtxKey{}, logF)
-}
-
 var _ driver.DriverContext = (*drv)(nil)
 var _ driver.Connector = (*connector)(nil)
+var _ io.Closer = (*connector)(nil)
 
 type connector struct {
 	drv *drv
@@ -1027,16 +1146,18 @@ func (d *drv) OpenConnector(name string) (driver.Connector, error) {
 // time.
 func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
 	params := c.ConnectionParams
+	logger := c.CommonParams.Logger
 	if ctxValue := ctx.Value(paramsCtxKey{}); ctxValue != nil {
 		if cc, ok := ctxValue.(commonAndConnParams); ok {
 			// ContextWithUserPassw does not fill ConnParam.ConnectString
 			if cc.ConnectString == "" {
 				cc.ConnectString = params.ConnectString
 			}
-			if Log != nil {
-				Log("msg", "connect with params from context", "poolParams", params.PoolParams, "connParams", cc, "common", cc.CommonParams)
+			logger = cc.Logger
+			if logger != nil {
+				logger.Debug("connect with params from context", "poolParams", params.PoolParams, "connParams", cc, "common", cc.CommonParams)
 			}
-			return c.drv.createConnFromParams(dsn.ConnectionParams{
+			return c.drv.createConnFromParams(ctx, dsn.ConnectionParams{
 				CommonParams: cc.CommonParams, ConnParams: cc.ConnParams,
 				PoolParams: params.PoolParams,
 			})
@@ -1051,10 +1172,10 @@ func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
 		}
 	}
 
-	if Log != nil {
-		Log("msg", "connect", "poolParams", params.PoolParams, "connParams", params.ConnParams, "common", params.CommonParams)
+	if logger != nil {
+		logger.Debug("connect", "poolParams", params.PoolParams, "connParams", params.ConnParams, "common", params.CommonParams)
 	}
-	return c.drv.createConnFromParams(params)
+	return c.drv.createConnFromParams(ctx, params)
 }
 
 // Driver returns the underlying Driver of the Connector,
@@ -1062,11 +1183,21 @@ func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
 // on sql.DB.
 func (c connector) Driver() driver.Driver { return c.drv }
 
+// Close the connector's underlying driver.
+//
+// From Go 1.17 sql.DB.Close() will call this method.
+func (c connector) Close() error {
+	if c.drv == nil || c.drv == defaultDrv {
+		return nil
+	}
+	return c.drv.Close()
+}
+
 // NewSessionIniter returns a function suitable for use in NewConnector as onInit,
 //
 // Deprecated. Use ParseDSN + ConnectionParams.SetSessionParamOnInit and NewConnector.
 // which calls "ALTER SESSION SET <key>='<value>'" for each element of the given map.
-func NewSessionIniter(m map[string]string) func(driver.Conn) error {
+func NewSessionIniter(m map[string]string) func(context.Context, driver.ConnPrepareContext) error {
 	var buf strings.Builder
 	buf.WriteString("ALTER SESSION SET ")
 	for k, v := range m {
@@ -1075,7 +1206,7 @@ func NewSessionIniter(m map[string]string) func(driver.Conn) error {
 	}
 	return mkExecMany([]string{buf.String()})
 }
-func getOnInit(P *CommonParams) func(driver.Conn) error {
+func getOnInit(P *CommonParams) func(context.Context, driver.ConnPrepareContext) error {
 	if P.OnInit != nil {
 		return P.OnInit
 	}
@@ -1086,7 +1217,15 @@ func getOnInit(P *CommonParams) func(driver.Conn) error {
 		buf.WriteString("ALTER SESSION SET")
 		for _, kv := range P.AlterSession {
 			buf.WriteByte(' ')
-			fmt.Fprintf(&buf, "%s=q'(%s)'", kv[0], strings.Replace(kv[1], "'", "''", -1))
+			buf.WriteString(kv[0])
+			buf.WriteByte('=')
+			if strings.EqualFold(kv[0], "CURRENT_SCHEMA") {
+				buf.WriteString(kv[1])
+			} else {
+				buf.WriteByte('\'')
+				buf.WriteString(strings.Replace(kv[1], "'", "''", -1))
+				buf.WriteByte('\'')
+			}
 		}
 		stmts = append(stmts, buf.String())
 	}
@@ -1099,19 +1238,45 @@ func getOnInit(P *CommonParams) func(driver.Conn) error {
 }
 
 // mkExecMany returns a function that applies the queries to the connection.
-func mkExecMany(qrys []string) func(driver.Conn) error {
-	return func(conn driver.Conn) error {
+func mkExecMany(qrys []string) func(context.Context, driver.ConnPrepareContext) error {
+	return func(ctx context.Context, conn driver.ConnPrepareContext) error {
+		logger := getLogger(ctx)
 		for _, qry := range qrys {
-			st, err := conn.Prepare(qry)
+			if logger != nil {
+				logger.Debug("execMany", "qry", qry)
+			}
+			st, err := conn.PrepareContext(ctx, qry)
+			if err == nil {
+				_, err = st.(driver.StmtExecContext).ExecContext(ctx, nil)
+				st.Close()
+			}
 			if err != nil {
 				return fmt.Errorf("%s: %w", qry, err)
-			}
-			_, err = st.Exec(nil) //lint:ignore SA1019 it's hard to use ExecContext here
-			st.Close()
-			if err != nil {
-				return err
 			}
 		}
 		return nil
 	}
 }
+
+func nvlD(a, b time.Duration) time.Duration {
+	if a == 0 {
+		return b
+	}
+	return a
+}
+
+var logLingeringResourceStack atomic.Bool
+
+// LogLingeringResourceStack sets whether to log the lingering resource's (allocation) stack in Finalizer.
+// Default is to not log, as it consumes a few kiB for each resource (stmt, conn, queue, object type).
+//
+// Should not cause problem with bug-free program, that closes all stmt's ASAP.
+//
+// For programs that'd benefit this stack, enabling it may raise memory consumption
+// significantly over time. So enable it only for debugging!
+func LogLingeringResourceStack(b bool) { logLingeringResourceStack.Store(b) }
+
+var guardWithFinalizers atomic.Bool
+
+// GuardWithFinalizers sets whether we should guard resources with Finalizers.
+func GuardWithFinalizers(b bool) { guardWithFinalizers.Store(b) }

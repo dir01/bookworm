@@ -16,8 +16,11 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/godror/godror/slog"
 )
 
 // Number as string
@@ -36,8 +39,8 @@ type intType struct{}
 
 func (intType) String() string { return "Int64" }
 func (intType) ConvertValue(v interface{}) (driver.Value, error) {
-	if Log != nil {
-		Log("ConvertValue", "Int64", "value", v)
+	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+		logger.Debug("ConvertValue Int64", "value", v)
 	}
 	switch x := v.(type) {
 	case int8:
@@ -80,7 +83,7 @@ func (intType) ConvertValue(v interface{}) (driver.Value, error) {
 		}
 		return strconv.ParseInt(string(*x), 10, 64)
 	default:
-		return nil, fmt.Errorf("unknown type %T", v)
+		return nil, fmt.Errorf("%T: %w", v, errUnknownType)
 	}
 }
 
@@ -88,8 +91,8 @@ type floatType struct{}
 
 func (floatType) String() string { return "Float64" }
 func (floatType) ConvertValue(v interface{}) (driver.Value, error) {
-	if Log != nil {
-		Log("ConvertValue", "Float64", "value", v)
+	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+		logger.Debug("ConvertValue Float64", "value", v)
 	}
 	switch x := v.(type) {
 	case int8:
@@ -126,7 +129,7 @@ func (floatType) ConvertValue(v interface{}) (driver.Value, error) {
 		}
 		return strconv.ParseFloat(string(*x), 64)
 	default:
-		return nil, fmt.Errorf("unknown type %T", v)
+		return nil, fmt.Errorf("%T: %w", v, errUnknownType)
 	}
 }
 
@@ -134,8 +137,8 @@ type numType struct{}
 
 func (numType) String() string { return "Num" }
 func (numType) ConvertValue(v interface{}) (driver.Value, error) {
-	if Log != nil {
-		Log("ConvertValue", "Num", "value", v)
+	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+		logger.Debug("ConvertValue Num", "value", v)
 	}
 	switch x := v.(type) {
 	case string:
@@ -153,12 +156,33 @@ func (numType) ConvertValue(v interface{}) (driver.Value, error) {
 			return 0, nil
 		}
 		return string(*x), nil
-	case int8, int16, int32, int64, uint16, uint32, uint64:
-		return fmt.Sprintf("%d", x), nil
-	case float32, float64:
-		return fmt.Sprintf("%f", x), nil
+	case int8:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int16:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int32:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int64:
+		return strconv.FormatInt(x, 10), nil
+	case uint16:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint64:
+		return strconv.FormatUint(x, 10), nil
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 32), nil
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64), nil
+	case decimalDecompose:
+		if x == nil {
+			return "", fmt.Errorf("nil Decomposer")
+		}
+		var n Number
+		err := n.Compose(x.Decompose(nil))
+		return string(n), err
 	default:
-		return nil, fmt.Errorf("unknown type %T", v)
+		return nil, fmt.Errorf("%T: %w", v, errUnknownType)
 	}
 }
 func (n Number) String() string { return string(n) }
@@ -185,12 +209,28 @@ func (n *Number) Scan(v interface{}) error {
 		} else {
 			*n = *x
 		}
-	case int8, int16, int32, int64, uint16, uint32, uint64:
-		*n = Number(fmt.Sprintf("%d", x))
-	case float32, float64:
-		*n = Number(fmt.Sprintf("%f", x))
+	case int8:
+		*n = Number(strconv.FormatInt(int64(x), 10))
+	case int16:
+		*n = Number(strconv.FormatInt(int64(x), 10))
+	case int32:
+		*n = Number(strconv.FormatInt(int64(x), 10))
+	case int64:
+		*n = Number(strconv.FormatInt(x, 10))
+	case uint16:
+		*n = Number(strconv.FormatUint(uint64(x), 10))
+	case uint32:
+		*n = Number(strconv.FormatUint(uint64(x), 10))
+	case uint64:
+		*n = Number(strconv.FormatUint(x, 10))
+	case float32:
+		*n = Number(strconv.FormatFloat(float64(x), 'f', -1, 32))
+	case float64:
+		*n = Number(strconv.FormatFloat(x, 'f', -1, 64))
+	case decimalDecompose:
+		return n.Compose(x.Decompose(nil))
 	default:
-		return fmt.Errorf("unknown type %T", v)
+		return fmt.Errorf("%T: %w", v, errUnknownType)
 	}
 	return nil
 }
@@ -321,6 +361,9 @@ func (ce CompileError) Error() string {
 //
 // If all is false, only errors are returned; otherwise, warnings, too.
 func GetCompileErrors(ctx context.Context, queryer Querier, all bool) ([]CompileError, error) {
+	if queryer == nil {
+		return nil, fmt.Errorf("nil queryer")
+	}
 	rows, err := queryer.QueryContext(ctx, `
 	SELECT USER owner, name, type, line, position, message_number, text, attribute
 		FROM user_errors
@@ -387,6 +430,10 @@ func MapToSlice(qry string, metParam func(string) interface{}) (string, []interf
 			if prev == '*' && r == '/' {
 				state = 0
 			}
+		case 4:
+			if r == '\'' {
+				state = 0
+			}
 		case 0:
 			switch r {
 			case '-':
@@ -397,6 +444,8 @@ func MapToSlice(qry string, metParam func(string) interface{}) (string, []interf
 				if prev == '/' {
 					state = 3
 				}
+			case '\'':
+				state = 4
 			case ':':
 				state = 1
 				p = i
@@ -423,6 +472,10 @@ func MapToSlice(qry string, metParam func(string) interface{}) (string, []interf
 
 // EnableDbmsOutput enables DBMS_OUTPUT buffering on the given connection.
 // This is required if you want to retrieve the output with ReadDbmsOutput later.
+//
+// Warning! EnableDbmsOutput, the code that uses DBMS_OUTPUT and ReadDbmsOutput
+// must all execute on the same session - for example by using the same *sql.Tx,
+// or *sql.Conn. A *sql.DB connection pool won't work!
 func EnableDbmsOutput(ctx context.Context, conn Execer) error {
 	qry := "BEGIN DBMS_OUTPUT.enable(NULL); END;"
 	_, err := conn.ExecContext(ctx, qry)
@@ -435,6 +488,10 @@ func EnableDbmsOutput(ctx context.Context, conn Execer) error {
 // ReadDbmsOutput copies the DBMS_OUTPUT buffer into the given io.Writer.
 //
 // Be sure that you enable it beforehand (either with EnableDbmsOutput or with DBMS_OUTPUT.enable(NULL))
+//
+// Warning! EnableDbmsOutput, the code that uses DBMS_OUTPUT and ReadDbmsOutput
+// must all execute on the same session - for example by using the same *sql.Tx,
+// or *sql.Conn. A *sql.DB connection pool won't work!
 func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 	const maxNumLines = 128
 	bw := bufio.NewWriterSize(w, maxNumLines*(32<<10))
@@ -459,7 +516,7 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 			return fmt.Errorf("%s: %w", qry, err)
 		}
 		if numLines == 0 {
-			continue
+			break
 		}
 		for i := 0; i < int(numLines); i++ {
 			_, _ = bw.WriteString(lines[i])
@@ -469,9 +526,10 @@ func ReadDbmsOutput(ctx context.Context, w io.Writer, conn preparer) error {
 			}
 		}
 		if int(numLines) < len(lines) {
-			return bw.Flush()
+			break
 		}
 	}
+	return bw.Flush()
 }
 
 // ClientVersion returns the VersionInfo from the DB.
@@ -502,13 +560,16 @@ type Conn interface {
 	Break() error
 	Commit() error
 	Rollback() error
+
 	ClientVersion() (VersionInfo, error)
 	ServerVersion() (VersionInfo, error)
-	GetObjectType(name string) (*ObjectType, error)
-	NewSubscription(string, func(Event), ...SubscriptionOption) (*Subscription, error)
 	Startup(StartupMode) error
 	Shutdown(ShutdownMode) error
+
+	NewSubscription(string, func(Event), ...SubscriptionOption) (*Subscription, error)
+	GetObjectType(name string) (*ObjectType, error)
 	NewData(baseType interface{}, SliceLen, BufSize int) ([]*Data, error)
+	NewTempLob(isClob bool) (*DirectLob, error)
 
 	Timezone() *time.Location
 	GetPoolStats() (PoolStats, error)
@@ -535,6 +596,9 @@ var getConnMu sync.Mutex
 
 // getConn will acquire a separate connection to the same DB as what ex is connected to.
 func getConn(ctx context.Context, ex Execer) (*conn, error) {
+	if ex == nil {
+		return nil, fmt.Errorf("nil ex")
+	}
 	getConnMu.Lock()
 	defer getConnMu.Unlock()
 	var c interface{}
@@ -588,4 +652,121 @@ func Raw(ctx context.Context, ex Execer, f func(driverConn Conn) error) error {
 	}
 	defer cx.Close()
 	return f(cx)
+}
+
+// ConnPool is a concurrent-safe fixed size connection pool.
+//
+// This is a very simple implementation, usable, but serving more as an example - if possible, use *sql.DB !
+type ConnPool struct {
+	get      func(context.Context) (*sql.Conn, error)
+	freeList chan *PooledConn
+}
+
+// NewConnPool returns a connection pool that acquires new connections from the given pool (an *sql.DB for example).
+//
+// The default size is 1.
+func NewConnPool(pool interface {
+	Conn(context.Context) (*sql.Conn, error)
+}, size int) *ConnPool {
+	if pool == nil {
+		panic(fmt.Errorf("nil pool"))
+	}
+	if size < 1 {
+		size = 1
+	}
+	return &ConnPool{get: pool.Conn, freeList: make(chan *PooledConn, size)}
+}
+
+// Conn returns a pooled connection if there exists one, or creates a new if not.
+//
+// You must call Close on the returned PooledConn to return it to the pool!
+func (p *ConnPool) Conn(ctx context.Context) (*PooledConn, error) {
+	if p == nil {
+		return nil, fmt.Errorf("nil ConnPool")
+	}
+	select {
+	case c := <-p.freeList:
+		return c, nil
+	default:
+	}
+	c, err := p.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &PooledConn{Conn: c, pool: p}, nil
+}
+
+// Close releases all the pooled resources.
+func (p *ConnPool) Close() error {
+	if p == nil || p.freeList == nil {
+		return nil
+	}
+	freeList := p.freeList
+	p.get, p.freeList = nil, nil
+	close(freeList)
+	var firstErr error
+	for c := range freeList {
+		if c != nil && c.Conn != nil {
+			if err := c.Conn.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// PooledConn is a wrapped *sql.Conn that puts back the Conn into the pool on Close is possible (or does a real Close when the pool is full).
+type PooledConn struct {
+	*sql.Conn
+	pool *ConnPool
+}
+
+// Close tries to return the connection to the pool, or Closes it when the pools is full.
+func (c *PooledConn) Close() error {
+	if c == nil || c.Conn == nil {
+		return nil
+	}
+	if c.pool != nil && c.pool.freeList != nil {
+		select {
+		case c.pool.freeList <- c:
+			return nil
+		default:
+		}
+	}
+	conn := c.Conn
+	c.Conn, c.pool = nil, nil
+	return conn.Close()
+}
+
+// ReplaceQuestionPlacholders replaces ? marks with Oracle-supported :%d placeholders.
+//
+// THIS IS JUST A SIMPLE CONVENIENCE FUNCTION, WITHOUT WARRANTIES:
+// - does not handle '?' - mark in string
+// - does not handle --? - mark in line comment
+// - does not handle /*?*/ - mark in block comment
+func ReplaceQuestionPlacholders(qry string) string {
+	n := strings.Count(qry, "?")
+	if n == 0 {
+		return qry
+	}
+	nLog10, x := 1, 10
+	for n > x {
+		nLog10++
+		x *= 10
+	}
+	//fmt.Println("\n## n:", n, "x:", x, "nLog10:", nLog10)
+	num := make([]byte, 0, nLog10)
+	var buf strings.Builder
+	buf.Grow(len(qry) + n*(nLog10))
+	var idx int64
+	for i := strings.IndexByte(qry, '?'); i >= 0; i = strings.IndexByte(qry, '?') {
+		buf.WriteString(qry[:i])
+		qry = qry[i+1:]
+		buf.WriteByte(':')
+		idx++
+		num = strconv.AppendInt(num[:0], idx, 10)
+		buf.Write(num)
+	}
+	buf.WriteString(qry)
+	return buf.String()
 }
