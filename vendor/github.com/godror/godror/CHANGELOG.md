@@ -6,6 +6,33 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [v0.45.2]
+### Added
+- NoRetry option to disable re-execution of a statement on ORA-04061, ORA-04065 or ORA-04068
+- WarningAsError option to return ORA-24344 as an error instead of skipping it
+- SetAttribute that sidesteps ORA-21602
+
+### Changed
+- Make CLOB written sizem mismatch only a warning.
+
+## [v0.45.0]
+### Added
+- Add cloexec subpackage for setting the connections to FD_CLOEXEC.
+- Export DPI_NATIVE_TYPE_* constants for Data.NativeType comparisons.
+
+### Changed
+- Require Go 1.20 (drop support for Go 1.19)
+- ODPI-C v5.4.0
+
+## [v0.44.0]
+### Added
+- Allow specifying Token authentication
+- PartialBatch option for SAVE EXCEPTIONS handling
+- Obey to context cancelation (as the documentation says),
+not just deadlines
+- add noBreakOnContextCancel option as a safety valve it the previous
+change cause SIGSEGV.
+
 ## [v0.40.3]
 ### Changed
 - Fix compilation regression with Go 1.19, caused by introducing log/slog.

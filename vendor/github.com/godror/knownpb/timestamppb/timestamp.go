@@ -34,6 +34,11 @@ var (
 	_ = driver.Valuer((*Timestamp)(nil))
 )
 
+//go:generate go install github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto@latest
+//go:generate sh -c "mkdir -p $(go env GOPATH)/src/google/protobuf; curl -sS -L -m 30 -o $(go env GOPATH)/src/google/protobuf/timestamp.proto https://github.com/protocolbuffers/protobuf/raw/main/src/google/protobuf/timestamp.proto"
+//go:generate sh -c "protoc -I$(go env GOPATH)/src --go-vtproto_out=$(go env GOPATH)/src --go-vtproto_opt=features=marshal+unmarshal+size $(go env GOPATH)/src/google/protobuf/timestamp.proto"
+//go:generate sh -c "cp -a $(go env GOPATH)/src/google.golang.org/protobuf/types/known/timestamppb/timestamp_vtproto.pb.go timestamp_vtproto.go"
+
 // Timestamp is a wrapped timestamppb.Timestamp with proper JSON and XML marshaling (as string date).
 type Timestamp struct {
 	timestamppb.Timestamp

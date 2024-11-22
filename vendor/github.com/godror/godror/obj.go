@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -65,10 +66,7 @@ func (O *Object) GetAttribute(data *Data, name string) error {
 	}
 	// the maximum length of that buffer must be supplied
 	// in the value.asBytes.length attribute before calling this function.
-	if attr.NativeTypeNum == C.DPI_NATIVE_TYPE_BYTES && attr.OracleTypeNum == C.DPI_ORACLE_TYPE_NUMBER {
-		var a [39]byte
-		C.dpiData_setBytes(&data.dpiData, (*C.char)(unsafe.Pointer(&a[0])), C.uint32_t(len(a)))
-	}
+	data.prepare(attr.OracleTypeNum)
 
 	//fmt.Printf("getAttributeValue(%p, %p, %d, %+v)\n", O.dpiObject, attr.dpiObjectAttr, data.NativeTypeNum, data.dpiData)
 	if err := O.drv.checkExec(func() C.int {
@@ -105,7 +103,15 @@ func (O *Object) SetAttribute(name string, data *Data) error {
 	if err := O.drv.checkExec(func() C.int {
 		return C.dpiObject_setAttributeValue(O.dpiObject, attr.dpiObjectAttr, data.NativeTypeNum, &data.dpiData)
 	}); err != nil {
-		return fmt.Errorf("dpiObject_setAttributeValue NativeTypeNum=%d ObjectType=%v: %w", data.NativeTypeNum, data.ObjectType, err)
+		var info C.dpiObjectAttrInfo
+		C.dpiObjectAttr_getInfo(attr.dpiObjectAttr, &info)
+		return fmt.Errorf("dpiObject_setAttributeValue NativeTypeNum=%d ObjectType=%v typeInfo=%+v: %w", data.NativeTypeNum, data.ObjectType, info.typeInfo, err)
+	}
+	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+		logger.Debug("setAttributeValue", "dpiObject", fmt.Sprintf("%p", O.dpiObject),
+			attr.Name, fmt.Sprintf("%p", attr.dpiObjectAttr),
+			"nativeType", data.NativeTypeNum, "oracleType", attr.OracleTypeNum,
+			"p", fmt.Sprintf("%p", data))
 	}
 	return nil
 }
@@ -134,12 +140,8 @@ func (O *Object) ResetAttributes() error {
 		data.reset()
 		data.NativeTypeNum = attr.NativeTypeNum
 		data.ObjectType = attr.ObjectType
-		if attr.NativeTypeNum == C.DPI_NATIVE_TYPE_BYTES && attr.OracleTypeNum == C.DPI_ORACLE_TYPE_NUMBER {
-			a := make([]byte, attr.Precision)
-			C.dpiData_setBytes(&data.dpiData, (*C.char)(unsafe.Pointer(&a[0])), C.uint32_t(attr.Precision))
-		}
 		if C.dpiObject_setAttributeValue(O.dpiObject, attr.dpiObjectAttr, data.NativeTypeNum, &data.dpiData) == C.DPI_FAILURE {
-			return O.drv.getError()
+			return fmt.Errorf("ResetAttributes(%q, ott=%+v, %+v): %w", attr.Name, attr.OracleTypeNum, data, O.drv.getError())
 		}
 	}
 
@@ -786,6 +788,7 @@ func (O ObjectCollection) GetItem(data *Data, i int) error {
 		data.NativeTypeNum = O.CollectionOf.NativeTypeNum
 		data.implicitObj = true
 	}
+	data.prepare(O.CollectionOf.OracleTypeNum)
 	if C.dpiObject_getElementValueByIndex(O.dpiObject, idx, data.NativeTypeNum, &data.dpiData) == C.DPI_FAILURE {
 		return fmt.Errorf("get(%d[%d]): %w", idx, data.NativeTypeNum, O.drv.getError())
 	}
@@ -889,13 +892,15 @@ type ObjectType struct {
 	drv                                 *drv
 	dpiObjectType                       *C.dpiObjectType
 	Schema, Name, PackageName           string
+	Annotations                         []Annotation
 	DBSize, ClientSizeInBytes, CharSize int
 	mu                                  sync.RWMutex
 	OracleTypeNum                       C.dpiOracleTypeNum
 	NativeTypeNum                       C.dpiNativeTypeNum
-	Precision                           int16
-	Scale                               int8
-	FsPrecision                         uint8
+	DomainAnnotation
+	Precision   int16
+	Scale       int8
+	FsPrecision uint8
 }
 
 // AttributeNames returns the Attributes' names ordered as on the database (by ObjectAttribute.Sequence).
@@ -915,23 +920,21 @@ func (t *ObjectType) String() string {
 		return ""
 	}
 	if t.Schema == "" {
-		return t.Name
+		if t.PackageName == "" {
+			return t.Name
+		}
+		return t.PackageName + "." + t.Name
 	}
-	return t.Schema + "." + t.Name
+	if t.PackageName == "" {
+		return t.Schema + "." + t.Name
+	}
+	return t.Schema + "." + t.PackageName + "." + t.Name
 }
 
 func (t *ObjectType) IsObject() bool { return t != nil && t.NativeTypeNum == C.DPI_NATIVE_TYPE_OBJECT }
 
 // FullName returns the object's name with the schame prepended.
-func (t *ObjectType) FullName() string {
-	if t == nil {
-		return ""
-	}
-	if t.Schema == "" {
-		return t.Name
-	}
-	return t.Schema + "." + t.Name
-}
+func (t *ObjectType) FullName() string { return t.String() }
 
 // GetObjectType returns the ObjectType of a name.
 //
@@ -996,8 +999,9 @@ func (t *ObjectType) NewObject() (*Object, error) {
 	if t == nil {
 		return nil, errNilObjectType
 	}
-	logger := getLogger(context.TODO())
-	if logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+	ctx := context.TODO()
+	logger := getLogger(ctx)
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("NewObject", "name", t.Name)
 	}
 	obj := (*C.dpiObject)(C.malloc(C.sizeof_void))
@@ -1006,7 +1010,7 @@ func (t *ObjectType) NewObject() (*Object, error) {
 	t.mu.RUnlock()
 	if err != nil {
 		C.free(unsafe.Pointer(obj))
-		return nil, err
+		return nil, fmt.Errorf("NewObject(%q [%+v]: %w", t.Name, t, err)
 	}
 	O := &Object{ObjectType: t, dpiObject: obj}
 
@@ -1202,17 +1206,27 @@ func (t *ObjectType) init(cache map[string]*ObjectType) error {
 
 func (t *ObjectType) fromDataTypeInfo(typ C.dpiDataTypeInfo, cache map[string]*ObjectType) error {
 	t.dpiObjectType = typ.objectType
-
-	t.OracleTypeNum = typ.oracleTypeNum
-	t.NativeTypeNum = typ.defaultNativeTypeNum
 	t.DBSize = int(typ.dbSizeInBytes)
 	t.ClientSizeInBytes = int(typ.clientSizeInBytes)
 	t.CharSize = int(typ.sizeInChars)
 	t.Precision = int16(typ.precision)
 	t.Scale = int8(typ.scale)
 	t.FsPrecision = uint8(typ.fsPrecision)
+	t.DomainAnnotation.init(typ)
+	t.OracleTypeNum = typ.oracleTypeNum
+	t.NativeTypeNum = typ.defaultNativeTypeNum
+	if t.OracleTypeNum == C.DPI_ORACLE_TYPE_NUMBER &&
+		(t.NativeTypeNum == C.DPI_NATIVE_TYPE_FLOAT &&
+			(t.Scale != 0 || t.Precision >= 8)) ||
+		(t.NativeTypeNum == C.DPI_NATIVE_TYPE_DOUBLE &&
+			(t.Scale != 0 || t.Precision >= 15)) ||
+		(t.NativeTypeNum == C.DPI_NATIVE_TYPE_INT64 &&
+			(t.Scale != 0 || t.Precision >= 19)) {
+		t.NativeTypeNum = C.DPI_NATIVE_TYPE_BYTES
+	}
 	return t.init(cache)
 }
+
 func objectTypeFromDataTypeInfo(d *drv, typ C.dpiDataTypeInfo, cache map[string]*ObjectType) (*ObjectType, error) {
 	if d == nil {
 		panic("drv is nil")
@@ -1238,8 +1252,8 @@ func (A ObjectAttribute) Close() error {
 	if A.dpiObjectAttr == nil {
 		return nil
 	}
-	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
-		logger.Debug("ObjectAttribute.CloReplaceQuestionPlacholders()se", "name", A.Name)
+	if logger := getLogger(context.Background()); logger != nil && logger.Enabled(context.Background(), slog.LevelDebug) {
+		logger.Debug("ObjectAttribute.Close", "name", A.Name)
 	}
 	if err := A.ObjectType.drv.checkExec(func() C.int { return C.dpiObjectAttr_release(A.dpiObjectAttr) }); err != nil {
 		return err
@@ -1262,3 +1276,43 @@ type dataPool struct{ sync.Pool }
 
 func (dp *dataPool) Get() *Data  { return dp.Pool.Get().(*Data) }
 func (dp *dataPool) Put(d *Data) { d.reset(); dp.Pool.Put(d) }
+
+// SetAttribute sets an object's attribute, evading ORA-21602
+//
+// https://github.com/oracle/odpi/issues/186
+func SetAttribute(ctx context.Context, ex Execer, obj *Object, name string, data *Data) error {
+	err := obj.SetAttribute(name, data)
+	if err == nil {
+		return nil
+	}
+	var ec interface{ Code() int }
+	var qry string
+	var val any
+	if errors.As(err, &ec) && ec.Code() == 21602 {
+		val = data.GetObject()
+		qry = `DECLARE
+  v_obj %s := :1;
+BEGIN
+  v_obj.%s := :2;
+  :3 := v_obj;
+END;`
+	} else if false && // cannot set ROWID: https://github.com/oracle/odpi/issues/187
+		data.NativeTypeNum == 3004 && strings.Contains(err.Error(), "DPI-1014:") {
+		val = string(data.GetBytes())
+		qry = `DECLARE
+  v_obj %s := :1;
+  --v_rowid CONSTANT VARCHAR2(128) := :2;
+BEGIN
+  v_obj.%s := :2; --v_rowid;
+  :3 := v_obj;
+END;`
+	} else {
+		return err
+	}
+	qry = fmt.Sprintf(qry, obj.ObjectType.FullName(), name)
+	_, xErr := ex.ExecContext(ctx, qry, obj, val, sql.Out{Dest: obj})
+	if xErr == nil {
+		return nil
+	}
+	return fmt.Errorf("%s [%#v]: %w: %w", qry, val, xErr, err)
+}
