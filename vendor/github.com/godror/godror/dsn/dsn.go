@@ -43,37 +43,41 @@ const (
 	DefaultWaitTimeout = 30 * time.Second
 	// DefaultMaxLifeTime is the maximum time in seconds till a pooled session may exist
 	DefaultMaxLifeTime = 1 * time.Hour
-	//DefaultStandaloneConnection holds the default for standaloneConnection.
-	DefaultStandaloneConnection = false
+	// DefaultStandaloneConnection holds the default for standaloneConnection.
+	DefaultStandaloneConnection = true
+	// DefaultNoBreakOnContextCancel holds the default for noBreakOnContext
+	DefaultNoBreakOnContextCancel = false
 )
 
 type CommonSimpleParams struct {
 	Timezone                *time.Location
 	ConfigDir, LibDir       string
 	Username, ConnectString string
+	Token, PrivateKey       string
 	Password                Password
 	Charset                 string
 	// StmtCacheSize of 0 means the default, -1 to disable the stmt cache completely
 	StmtCacheSize int
 	// true: OnInit will be called only by the new session / false: OnInit will called by new or pooled connection
-	InitOnNewConn           bool
-	EnableEvents, NoTZCheck bool
+	InitOnNewConn                               bool
+	EnableEvents, NoTZCheck, PerSessionTimezone bool
+	NoBreakOnContextCancel                      bool
 }
 
 // CommonParams holds the common parameters for pooled or standalone connections.
 //
 // For details, see https://oracle.github.io/odpi/doc/structs/dpiCommonCreateParams.html#dpicommoncreateparams
 type CommonParams struct {
-	CommonSimpleParams
 	// Logger is the per-pool or per-connection logger.
 	// The default nil logger does not log.
 	Logger *slog.Logger
 	// OnInit is executed on session init. Overrides AlterSession and OnInitStmts!
-	OnInit func(context.Context, driver.ConnPrepareContext) error
+	OnInit func(context.Context, driver.ConnPrepareContext) error `json:"-"`
 	// OnInitStmts are executed on session init, iff OnInit is nil.
 	OnInitStmts []string
 	// AlterSession key-values are set with "ALTER SESSION SET key=value" on session init, iff OnInit is nil.
 	AlterSession [][2]string
+	CommonSimpleParams
 }
 
 func (P CommonParams) String() string {
@@ -118,6 +122,9 @@ func (P CommonSimpleParams) String() string {
 	if P.NoTZCheck {
 		q.Add("noTimezoneCheck", "1")
 	}
+	if P.PerSessionTimezone {
+		q.Add("perSessionTimezone", "1")
+	}
 	if P.StmtCacheSize != 0 {
 		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
 	}
@@ -126,6 +133,9 @@ func (P CommonSimpleParams) String() string {
 	}
 	if P.InitOnNewConn {
 		q.Add("initOnNewConnection", "1")
+	}
+	if P.NoBreakOnContextCancel {
+		q.Add("noBreakOnContextCancel", "1")
 	}
 
 	s = q.String()
@@ -173,12 +183,20 @@ func (P ConnParams) String() string {
 	return q.String()
 }
 
+// AccessToken Data for Token Authentication.
+type AccessToken struct {
+	Token      string
+	PrivateKey string
+}
+
 // PoolParams holds the configuration of the Oracle Session Pool.
 //
 // For details, see https://oracle.github.io/odpi/doc/structs/dpiPoolCreateParams.html#dpipoolcreateparams
 //
 // For details, see https://oracle.github.io/odpi/doc/structs/dpiPoolCreateParams.html#dpipoolcreateparams
 type PoolParams struct {
+	TokenCBCtx                                 context.Context                           `json:"-"`
+	TokenCB                                    func(context.Context, *AccessToken) error `json:"-"`
 	MinSessions, MaxSessions, SessionIncrement int
 	MaxSessionsPerShard                        int
 	WaitTimeout, MaxLifeTime, SessionTimeout   time.Duration
@@ -215,8 +233,8 @@ func (P PoolParams) String() string {
 // You can use ConnectionParams{...}.StringWithPassword()
 // as a connection string in sql.Open.
 type ConnectionParams struct {
-	ConnParams
 	CommonParams
+	ConnParams
 	PoolParams
 	// ConnParams.NewPassword is used iff StandaloneConnection is true!
 	StandaloneConnection bool
@@ -281,6 +299,12 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	if withPassword {
 		q.Add("password", P.Password.Secret())
 		q.Add("newPassword", P.NewPassword.Secret())
+		if P.Token != "" {
+			q.Add("token", P.Token)
+		}
+		if P.PrivateKey != "" {
+			q.Add("privateKey", P.PrivateKey)
+		}
 	} else {
 		q.Add("password", P.Password.String())
 		if !P.NewPassword.IsZero() {
@@ -303,6 +327,7 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 		return "0"
 	}
 	q.Add("noTimezoneCheck", B(P.NoTZCheck))
+	q.Add("perSessionTimezone", B(P.PerSessionTimezone))
 	if P.StmtCacheSize != 0 {
 		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
 	}
@@ -318,7 +343,9 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	q.Add("sysdba", B(P.IsSysDBA))
 	q.Add("sysoper", B(P.IsSysOper))
 	q.Add("sysasm", B(P.IsSysASM))
-	q.Add("standaloneConnection", B(P.StandaloneConnection))
+	if P.StandaloneConnection {
+		q.Add("standaloneConnection", B(P.StandaloneConnection))
+	}
 	q.Add("enableEvents", B(P.EnableEvents))
 	q.Add("heterogeneousPool", B(P.Heterogeneous))
 	q.Add("externalAuth", B(P.ExternalAuth))
@@ -335,6 +362,7 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 		q.Add("alterSession", strings.TrimSpace(as.String()))
 	}
 	q.Add("initOnNewConnection", B(P.InitOnNewConn))
+	q.Add("noBreakOnContextCancel", B(P.NoBreakOnContextCancel))
 	q.Values["onInit"] = P.OnInitStmts
 	q.Add("configDir", P.ConfigDir)
 	q.Add("libDir", P.LibDir)
@@ -393,7 +421,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		}
 		//fmt.Printf("URL=%s cs=%q host=%q port=%q path=%q\n", u, P.ConnectString, u.Host, u.Port(), u.Path)
 		q = u.Query()
-	} else if strings.Contains(dataSourceName, "\n") || // multi-line, or
+	} else if strings.IndexByte(dataSourceName, '\n') >= 0 || // multi-line, or
 		strings.Contains(dataSourceName, "connectString=") { // contains connectString
 		// This should be a proper logfmt-encoded parameter string, with connectString
 		paramsString, dataSourceName = dataSourceName, ""
@@ -439,6 +467,10 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 					P.Password.Set(value)
 				case "charset":
 					P.Charset = value
+				case "token":
+					P.Token = value
+				case "privateKey":
+					P.PrivateKey = value
 				case "alterSession", "onInit", "shardingKey", "superShardingKey":
 					q.Add(key, value)
 				default:
@@ -446,6 +478,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 				}
 			}
 		}
+		// fmt.Printf("Parse q=%#v\n", q)
 		if err := d.Err(); err != nil {
 			return P, fmt.Errorf("parsing parameters %q: %w", paramsString, err)
 		}
@@ -472,7 +505,9 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		{&P.StandaloneConnection, "standaloneConnection"},
 
 		{&P.NoTZCheck, "noTimezoneCheck"},
+		{&P.PerSessionTimezone, "perSessionTimezone"},
 		{&P.InitOnNewConn, "initOnNewConnection"},
+		{&P.NoBreakOnContextCancel, "noBreakOnContextCancel"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -486,6 +521,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 			P.StandaloneConnection = !P.Heterogeneous
 		}
 	}
+	// fmt.Println("parse", P.StringWithPassword())
 
 	if tz := q.Get("timezone"); tz != "" {
 		if strings.EqualFold(tz, "local") {
@@ -590,10 +626,10 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 	P.ConfigDir = q.Get("configDir")
 	P.LibDir = q.Get("libDir")
 
-	//fmt.Printf("cs1=%q\n", P.ConnectString)
+	// fmt.Printf("cs1=%q\n", P)
 	P.comb()
 
-	//fmt.Printf("cs2=%q\n", P.ConnectString)
+	// fmt.Printf("cs2=%q\n", P)
 
 	return P, nil
 }

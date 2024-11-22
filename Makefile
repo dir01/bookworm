@@ -14,7 +14,7 @@ test: # Run unit tests
 .PHONY: test
 
 docker-test: # Run unit tests in a Docker container
-	docker-compose run --rm --build bookworm make test
+	docker compose run --rm --build bookworm make test
 .PHONY: docker-test
 
 precommit: # Run all possible checks before committing

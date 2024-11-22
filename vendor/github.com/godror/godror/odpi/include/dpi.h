@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2023, Oracle and/or its affiliates.
+// Copyright (c) 2016, 2024, Oracle and/or its affiliates.
 //
 // This software is dual-licensed to you under the Universal Permissive License
 // (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl and Apache License
@@ -69,8 +69,8 @@ extern "C" {
 
 // define ODPI-C version information
 #define DPI_MAJOR_VERSION   5
-#define DPI_MINOR_VERSION   0
-#define DPI_PATCH_LEVEL     1
+#define DPI_MINOR_VERSION   4
+#define DPI_PATCH_LEVEL     0
 #define DPI_VERSION_SUFFIX
 
 #define DPI_STR_HELPER(x)       #x
@@ -245,6 +245,7 @@ typedef uint32_t dpiNativeTypeNum;
 #define DPI_NATIVE_TYPE_JSON_OBJECT                 3014
 #define DPI_NATIVE_TYPE_JSON_ARRAY                  3015
 #define DPI_NATIVE_TYPE_NULL                        3016
+#define DPI_NATIVE_TYPE_VECTOR                      3017
 
 // operation codes (database change and continuous query notification)
 typedef uint32_t dpiOpCode;
@@ -291,7 +292,10 @@ typedef uint32_t dpiOracleTypeNum;
 #define DPI_ORACLE_TYPE_JSON_ARRAY                  2029
 #define DPI_ORACLE_TYPE_UROWID                      2030
 #define DPI_ORACLE_TYPE_LONG_NVARCHAR               2031
-#define DPI_ORACLE_TYPE_MAX                         2032
+#define DPI_ORACLE_TYPE_XMLTYPE                     2032
+#define DPI_ORACLE_TYPE_VECTOR                      2033
+#define DPI_ORACLE_TYPE_JSON_ID                     2034
+#define DPI_ORACLE_TYPE_MAX                         2035
 
 // session pool close modes
 typedef uint32_t dpiPoolCloseMode;
@@ -331,6 +335,13 @@ typedef uint32_t dpiStartupMode;
 #define DPI_MODE_STARTUP_DEFAULT                    0
 #define DPI_MODE_STARTUP_FORCE                      1
 #define DPI_MODE_STARTUP_RESTRICT                   2
+
+// server types
+typedef uint8_t dpiServerType;
+#define DPI_SERVER_TYPE_UNKNOWN                     0
+#define DPI_SERVER_TYPE_DEDICATED                   1
+#define DPI_SERVER_TYPE_SHARED                      2
+#define DPI_SERVER_TYPE_POOLED                      4
 
 // statement types
 typedef uint16_t dpiStatementType;
@@ -391,6 +402,17 @@ typedef uint32_t dpiTpcEndFlags;
 #define DPI_TPC_END_NORMAL                          0
 #define DPI_TPC_END_SUSPEND                         0x00100000
 
+// vector flags
+typedef uint8_t dpiVectorFlags;
+#define DPI_VECTOR_FLAGS_FLEXIBLE_DIM               0x01
+
+// vector formats
+typedef uint8_t dpiVectorFormat;
+#define DPI_VECTOR_FORMAT_FLOAT32                   2
+#define DPI_VECTOR_FORMAT_FLOAT64                   3
+#define DPI_VECTOR_FORMAT_INT8                      4
+#define DPI_VECTOR_FORMAT_BINARY                    5
+
 // visibility of messages in advanced queuing
 typedef uint32_t dpiVisibility;
 #define DPI_VISIBILITY_IMMEDIATE                    1
@@ -421,15 +443,18 @@ typedef struct dpiSodaDocCursor dpiSodaDocCursor;
 typedef struct dpiStmt dpiStmt;
 typedef struct dpiSubscr dpiSubscr;
 typedef struct dpiVar dpiVar;
+typedef struct dpiVector dpiVector;
 
 
 //-----------------------------------------------------------------------------
 // Forward Declarations of Other Types
 //-----------------------------------------------------------------------------
 typedef struct dpiAccessToken dpiAccessToken;
+typedef struct dpiAnnotation dpiAnnotation;
 typedef struct dpiAppContext dpiAppContext;
 typedef struct dpiCommonCreateParams dpiCommonCreateParams;
 typedef struct dpiConnCreateParams dpiConnCreateParams;
+typedef struct dpiConnInfo dpiConnInfo;
 typedef struct dpiContextCreateParams dpiContextCreateParams;
 typedef struct dpiData dpiData;
 typedef union dpiDataBuffer dpiDataBuffer;
@@ -452,6 +477,8 @@ typedef struct dpiSubscrMessage dpiSubscrMessage;
 typedef struct dpiSubscrMessageQuery dpiSubscrMessageQuery;
 typedef struct dpiSubscrMessageRow dpiSubscrMessageRow;
 typedef struct dpiSubscrMessageTable dpiSubscrMessageTable;
+typedef struct dpiVectorInfo dpiVectorInfo;
+typedef union dpiVectorDimensionBuffer dpiVectorDimensionBuffer;
 typedef struct dpiVersionInfo dpiVersionInfo;
 typedef struct dpiXid dpiXid;
 
@@ -553,6 +580,15 @@ union dpiDataBuffer {
     dpiObject *asObject;
     dpiStmt *asStmt;
     dpiRowid *asRowid;
+    dpiVector *asVector;
+};
+
+// structure used for annotations
+struct dpiAnnotation {
+    const char *key;
+    uint32_t keyLength;
+    const char *value;
+    uint32_t valueLength;
 };
 
 // structure used for application context
@@ -606,13 +642,30 @@ struct dpiConnCreateParams {
     int outNewSession;
 };
 
-// structure used for creating connections
+// structure used for transferring connection information from ODPI-C
+struct dpiConnInfo {
+    const char *dbDomain;
+    uint32_t dbDomainLength;
+    const char *dbName;
+    uint32_t dbNameLength;
+    const char *instanceName;
+    uint32_t instanceNameLength;
+    const char *serviceName;
+    uint32_t serviceNameLength;
+    uint32_t maxIdentifierLength;
+    uint32_t maxOpenCursors;
+    uint8_t serverType;
+};
+
+// structure used for creating a context
 struct dpiContextCreateParams {
     const char *defaultDriverName;
     const char *defaultEncoding;
     const char *loadErrorUrl;
     const char *oracleClientLibDir;
     const char *oracleClientConfigDir;
+    int sodaUseJsonDesc;
+    int useJsonId;
 };
 
 // structure used for transferring data to/from ODPI-C
@@ -634,6 +687,16 @@ struct dpiDataTypeInfo {
     uint8_t fsPrecision;
     dpiObjectType *objectType;
     int isJson;
+    const char *domainSchema;
+    uint32_t domainSchemaLength;
+    const char *domainName;
+    uint32_t domainNameLength;
+    uint32_t numAnnotations;
+    dpiAnnotation *annotations;
+    int isOson;
+    uint32_t vectorDimensions;
+    uint8_t vectorFormat;
+    uint8_t vectorFlags;
 };
 
 // structure used for storing token authentication data
@@ -861,6 +924,23 @@ struct dpiVersionInfo {
     uint32_t fullVersionNum;
 };
 
+// union used for providing a buffer for vector dimensions
+union dpiVectorDimensionBuffer {
+    void* asPtr;
+    int8_t* asInt8;
+    float* asFloat;
+    double* asDouble;
+
+};
+
+// structure used for transferring vector information
+struct dpiVectorInfo {
+    uint8_t format;
+    uint32_t numDimensions;
+    uint8_t dimensionSize;
+    dpiVectorDimensionBuffer dimensions;
+};
+
 // structure used for defining two-phase commit transaction ids (XIDs)
 struct dpiXid {
     long formatId;
@@ -968,6 +1048,14 @@ DPI_EXPORT int dpiConn_getCallTimeout(dpiConn *conn, uint32_t *value);
 DPI_EXPORT int dpiConn_getCurrentSchema(dpiConn *conn, const char **value,
         uint32_t *valueLength);
 
+// get database domain name
+DPI_EXPORT int dpiConn_getDbDomain(dpiConn *conn, const char **value,
+        uint32_t *valueLength);
+
+// get database name
+DPI_EXPORT int dpiConn_getDbName(dpiConn *conn, const char **value,
+        uint32_t *valueLength);
+
 // get edition associated with the connection
 DPI_EXPORT int dpiConn_getEdition(dpiConn *conn, const char **value,
         uint32_t *valueLength);
@@ -981,6 +1069,9 @@ DPI_EXPORT int dpiConn_getExternalName(dpiConn *conn, const char **value,
 
 // get the OCI service context handle associated with the connection
 DPI_EXPORT int dpiConn_getHandle(dpiConn *conn, void **handle);
+
+// return information about the connection
+DPI_EXPORT int dpiConn_getInfo(dpiConn *conn, dpiConnInfo *info);
 
 // get instance name associated with the connection
 DPI_EXPORT int dpiConn_getInstanceName(dpiConn *conn, const char **value,
@@ -997,6 +1088,10 @@ DPI_EXPORT int dpiConn_getIsHealthy(dpiConn *conn, int *isHealthy);
 DPI_EXPORT int dpiConn_getLTXID(dpiConn *conn, const char **value,
         uint32_t *valueLength);
 
+// get the maximum number of open cursors allowed by the database
+DPI_EXPORT int dpiConn_getMaxOpenCursors(dpiConn *conn,
+        uint32_t *maxOpenCursors);
+
 // create a new object type and return it for subsequent object creation
 DPI_EXPORT int dpiConn_getObjectType(dpiConn *conn, const char *name,
         uint32_t nameLength, dpiObjectType **objType);
@@ -1011,11 +1106,19 @@ DPI_EXPORT int dpiConn_getServerVersion(dpiConn *conn,
         const char **releaseString, uint32_t *releaseStringLength,
         dpiVersionInfo *versionInfo);
 
+// get the service name used to connect to the database
+DPI_EXPORT int dpiConn_getServiceName(dpiConn *conn, const char **value,
+        uint32_t *valueLength);
+
 // get SODA interface object
 DPI_EXPORT int dpiConn_getSodaDb(dpiConn *conn, dpiSodaDb **db);
 
 // return the statement cache size
 DPI_EXPORT int dpiConn_getStmtCacheSize(dpiConn *conn, uint32_t *cacheSize);
+
+// get whether or not a transaction is in progress
+DPI_EXPORT int dpiConn_getTransactionInProgress(dpiConn *conn,
+        int *txnInProgress);
 
 // create a new dequeue options object and return it
 DPI_EXPORT int dpiConn_newDeqOptions(dpiConn *conn, dpiDeqOptions **options);
@@ -1046,6 +1149,10 @@ DPI_EXPORT int dpiConn_newVar(dpiConn *conn, dpiOracleTypeNum oracleTypeNum,
         dpiNativeTypeNum nativeTypeNum, uint32_t maxArraySize, uint32_t size,
         int sizeIsBytes, int isArray, dpiObjectType *objType, dpiVar **var,
         dpiData **data);
+
+// create a new vector
+DPI_EXPORT int dpiConn_newVector(dpiConn *conn, dpiVectorInfo *info,
+        dpiVector **vector);
 
 // ping the connection to see if it is still alive
 DPI_EXPORT int dpiConn_ping(dpiConn *conn);
@@ -1883,10 +1990,15 @@ DPI_EXPORT int dpiSodaDb_createCollection(dpiSodaDb *db, const char *name,
         uint32_t nameLength, const char *metadata, uint32_t metadataLength,
         uint32_t flags, dpiSodaColl **coll);
 
-// create a new SODA document
+// create a new SODA document with binary or encoded text content
 DPI_EXPORT int dpiSodaDb_createDocument(dpiSodaDb *db, const char *key,
         uint32_t keyLength, const char *content, uint32_t contentLength,
         const char *mediaType, uint32_t mediaTypeLength, uint32_t flags,
+        dpiSodaDoc **doc);
+
+// create a new SODA document with JSON content
+DPI_EXPORT int dpiSodaDb_createJsonDocument(dpiSodaDb *db, const char *key,
+        uint32_t keyLength, const dpiJsonNode *content, uint32_t flags,
         dpiSodaDoc **doc);
 
 // free the memory allocated when getting an array of SODA collection names
@@ -1917,13 +2029,19 @@ DPI_EXPORT int dpiSodaDb_release(dpiSodaDb *db);
 // add a reference to the SODA document
 DPI_EXPORT int dpiSodaDoc_addRef(dpiSodaDoc *cursor);
 
-// get the content of the document
+// get the binary or encoded text content of the document
 DPI_EXPORT int dpiSodaDoc_getContent(dpiSodaDoc *doc, const char **value,
         uint32_t *valueLength, const char **encoding);
 
 // get the created timestamp associated with the document
 DPI_EXPORT int dpiSodaDoc_getCreatedOn(dpiSodaDoc *doc, const char **value,
         uint32_t *valueLength);
+
+// get whether the document contains a JSON document or not
+DPI_EXPORT int dpiSodaDoc_getIsJson(dpiSodaDoc *doc, int *isJson);
+
+// get the JSON content of the document
+DPI_EXPORT int dpiSodaDoc_getJsonContent(dpiSodaDoc *doc, dpiJson **value);
 
 // get the key associated with the document
 DPI_EXPORT int dpiSodaDoc_getKey(dpiSodaDoc *doc, const char **value,
@@ -2181,8 +2299,28 @@ DPI_EXPORT int dpiVar_setFromRowid(dpiVar *var, uint32_t pos, dpiRowid *rowid);
 // set the value of the variable from a statement
 DPI_EXPORT int dpiVar_setFromStmt(dpiVar *var, uint32_t pos, dpiStmt *stmt);
 
+// set the value of the variable from a vector
+DPI_EXPORT int dpiVar_setFromVector(dpiVar *var, uint32_t pos,
+        dpiVector *vector);
+
 // set the number of elements in a PL/SQL index-by table
 DPI_EXPORT int dpiVar_setNumElementsInArray(dpiVar *var, uint32_t numElements);
+
+//-----------------------------------------------------------------------------
+// Vector Methods (dpiVector)
+//-----------------------------------------------------------------------------
+
+// add a reference to the vector
+DPI_EXPORT int dpiVector_addRef(dpiVector *vector);
+
+// get information about the vector
+DPI_EXPORT int dpiVector_getValue(dpiVector *vector, dpiVectorInfo *info);
+
+// release a reference to the vector
+DPI_EXPORT int dpiVector_release(dpiVector *vector);
+
+// set the contents of the vector
+DPI_EXPORT int dpiVector_setValue(dpiVector *vector, dpiVectorInfo *info);
 
 #ifdef __cplusplus
 }

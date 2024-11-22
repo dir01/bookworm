@@ -19,6 +19,10 @@ void godror_setFromString(dpiVar *dv, uint32_t pos, const _GoString_ value) {
 	}
 	dpiVar_setFromBytes(dv, pos, _GoStringPtr(value), length);
 }
+
+dpiAnnotation godror_getAnnotation(dpiAnnotation *annotations, int32_t idx) {
+	return annotations[idx];
+}
 */
 import "C"
 import (
@@ -31,6 +35,7 @@ import (
 	"io"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +67,9 @@ type stmtOptions struct {
 	deleteFromCache    bool
 	numberAsString     bool
 	numberAsFloat64    bool
+	partialBatch       bool
+	warningAsError     bool
+	noRetry            bool
 }
 
 type boolString struct {
@@ -133,6 +141,7 @@ func (o stmtOptions) NullDate() interface{} {
 func (o stmtOptions) DeleteFromCache() bool { return o.deleteFromCache }
 func (o stmtOptions) NumberAsString() bool  { return o.numberAsString }
 func (o stmtOptions) NumberAsFloat64() bool { return o.numberAsFloat64 }
+func (o stmtOptions) PartialBatch() bool    { return o.partialBatch }
 
 // Option holds statement options.
 //
@@ -281,6 +290,18 @@ func NumberAsString() Option { return func(o *stmtOptions) { o.numberAsString = 
 // NumberAsFloat64 is an option to return numbers as float64, not Number (which is a string).
 func NumberAsFloat64() Option { return func(o *stmtOptions) { o.numberAsFloat64 = true } }
 
+// PartialBatch is an option to allow batch executing like FORALL SAVE EXCEPTIONS.
+//
+// WARNING: this means the INSERT/UPDATE/DELETE statement may be executed partially.
+// In such case the returned error is a BatchErrors containing the failed offsets.
+func PartialBatch() Option { return func(o *stmtOptions) { o.partialBatch = true } }
+
+// Return ORA-24344 warning as an error
+func WarningAsError() Option { return func(o *stmtOptions) { o.warningAsError = true } }
+
+// Do not re-execute statement if ORA-04061, ORA-04065 or ORA-04068 occurs
+func NoRetry() Option { return func(o *stmtOptions) { o.noRetry = true } }
+
 const minChunkSize = 1 << 16
 
 var _ driver.Stmt = (*statement)(nil)
@@ -305,7 +326,7 @@ type statement struct {
 	dpiStmtInfo C.dpiStmtInfo
 	sync.Mutex
 }
-type dataGetter func(v interface{}, data []C.dpiData) error
+type dataGetter func(ctx context.Context, v interface{}, data []C.dpiData) error
 
 // Close closes the statement.
 //
@@ -318,9 +339,9 @@ func (st *statement) Close() error {
 	st.Lock()
 	defer st.Unlock()
 
-	return st.closeNotLocking()
+	return st.closeNotLocking(context.Background())
 }
-func (st *statement) closeNotLocking() error {
+func (st *statement) closeNotLocking(ctx context.Context) error {
 	if st == nil || st.dpiStmt == nil {
 		return nil
 	}
@@ -339,7 +360,7 @@ func (st *statement) closeNotLocking() error {
 	st.dpiStmtInfo = C.dpiStmtInfo{}
 	st.ctx = nil
 
-	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+	if logger := getLogger(ctx); logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("statement.closeNotLocking", "st", fmt.Sprintf("%p", st), "refCount", dpiStmt.refCount)
 		if printStack {
 			var a [4096]byte
@@ -434,13 +455,13 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		}
 		c := st.conn
 		if err = maybeBadConn(err, c); err == driver.ErrBadConn {
-			_ = st.closeNotLocking()
+			_ = st.closeNotLocking(ctx)
 		}
 		return err
 	}
 
 	// bind variables
-	if err = st.bindVars(args, logger); err != nil {
+	if err = st.bindVars(ctx, args, logger); err != nil {
 		return nil, closeIfBadConn(err)
 	}
 
@@ -456,6 +477,9 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 	var f func() C.int
 	many := !st.PlSQLArrays() && st.arrLen > 0
 	if many {
+		if st.PartialBatch() {
+			mode |= C.DPI_MODE_EXEC_BATCH_ERRORS
+		}
 		f = func() C.int { return C.dpiStmt_executeMany(st.dpiStmt, mode, C.uint32_t(st.arrLen)) }
 	} else {
 		f = func() C.int { return C.dpiStmt_execute(st.dpiStmt, mode, nil) }
@@ -464,21 +488,92 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("dpiStmt_execute", "st", fmt.Sprintf("%p", st.dpiStmt), "many", many, "mode", mode, "len", st.arrLen)
 		}
-		if err = st.checkExec(f); err == nil {
+		done := make(chan struct{})
+		if !st.conn.params.NoBreakOnContextCancel {
+			// Forcefully BREAK execution on context cancelation
+			go func() {
+				select {
+				case <-done:
+				case <-ctx.Done():
+					select {
+					case <-done:
+					default:
+						if logger != nil {
+							logger.Warn("BREAK dpiStmt_execute")
+						}
+						st.conn.Break()
+					}
+				}
+			}()
+		}
+		if err = func() error {
+			defer close(done)
+			if st.warningAsError {
+				return st.checkExecWithWarning(f)
+			} else {
+				return st.checkExec(f)
+			}
+		}(); err == nil {
 			break
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if !isInvalidErr(err) {
+		if st.noRetry || !isInvalidErr(err) {
 			break
 		}
 	}
-	if err != nil {
-		return nil, closeIfBadConn(err) //fmt.Errorf("dpiStmt_execute(mode=%d arrLen=%d): %w", mode, arrLen, err))
+	if err != nil && (!many || !st.PartialBatch() || closeIfBadConn(err) == driver.ErrBadConn) {
+		return nil, err
 	}
 
-	if logger != nil {
+	var batchErrors error
+	if many {
+		if batchErrors = func() error {
+			var errInfos []C.dpiErrorInfo
+			var errCnt C.uint32_t
+			var rc C.int
+			runtime.LockOSThread()
+			if C.dpiStmt_getBatchErrorCount(st.dpiStmt, &errCnt) != C.DPI_FAILURE && errCnt != 0 {
+				errInfos = make([]C.dpiErrorInfo, int(errCnt))
+				rc = C.dpiStmt_getBatchErrors(st.dpiStmt, errCnt, &errInfos[0])
+			}
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
+				logger.Debug("batchErrors", "errCnt", errCnt)
+			}
+			runtime.UnlockOSThread()
+			if rc == C.DPI_FAILURE || len(errInfos) == 0 {
+				return nil
+			}
+			be := BatchErrors{
+				Unaffected: make([]int, 0, len(errInfos)),
+				Errs:       make([]*OraErr, 0, len(errInfos)),
+			}
+			for _, ei := range errInfos {
+				if e := fromErrorInfo(ei); e != nil {
+					oe := e.(*OraErr)
+					be.Errs = append(be.Errs, oe)
+					be.Unaffected = append(be.Unaffected, oe.offset)
+				}
+			}
+			sort.Ints(be.Unaffected)
+			be.Affected = make([]int, 0, len(errInfos)-len(be.Unaffected))
+			for i := 0; i < st.arrLen; i++ {
+				if j := sort.SearchInts(be.Unaffected, i); j < 0 || j >= len(be.Unaffected) || be.Unaffected[j] != i {
+					be.Affected = append(be.Affected, i)
+				}
+			}
+			return &be
+		}(); batchErrors != nil {
+			if logger != nil && logger.Enabled(ctx, slog.LevelWarn) {
+				logger.Warn("batch", "errors", batchErrors)
+			}
+		} else {
+			batchErrors = err
+		}
+	}
+
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("get/set", "gets", st.gets, "dests", st.dests)
 	}
 	for i, get := range st.gets {
@@ -500,13 +595,13 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		}
 		dest := st.dests[i]
 		if !st.isSlice[i] {
-			if err := get(dest, st.data[i]); err != nil {
+			if err := get(ctx, dest, st.data[i]); err != nil {
 				if logger != nil {
 					logger.Error("get", "i", i, "error", err)
 				}
 				return nil, closeIfBadConn(fmt.Errorf("%d. get[%d]: %w", i, 0, err))
 			}
-			if logger != nil {
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 				logger.Debug("get-not-slice", "i", i, "dest", dest)
 			}
 			continue
@@ -519,7 +614,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 			return nil, closeIfBadConn(fmt.Errorf("%d.getNumElementsInArray: %w", i, err))
 		}
 		//fmt.Printf("i=%d dest=%T %#v\n", i, dest, dest)
-		if err := get(dest, st.data[i][:n]); err != nil {
+		if err := get(ctx, dest, st.data[i][:n]); err != nil {
 			if logger != nil {
 				logger.Error("get", "i", i, "n", n, "error", err)
 			}
@@ -527,10 +622,13 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		}
 	}
 	var count C.uint64_t
-	if st.checkExec(func() C.int { return C.dpiStmt_getRowCount(st.dpiStmt, &count) }) != nil {
-		return nil, nil
+	if err := st.checkExec(func() C.int { return C.dpiStmt_getRowCount(st.dpiStmt, &count) }); err != nil {
+		if logger != nil {
+			logger.Error("getRowCount", "error", err)
+		}
+		return nil, batchErrors
 	}
-	return driver.RowsAffected(count), nil
+	return driver.RowsAffected(count), batchErrors
 }
 
 // QueryContext executes a query that may return rows, such as a SELECT.
@@ -562,13 +660,13 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 	logger := st.conn.getLogger(ctx)
 	switch st.query {
 	case getConnection:
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("QueryContext", "args", args)
 		}
 		return &directRow{conn: st.conn, query: st.query, result: []interface{}{st.conn}}, nil
 
 	case wrapResultset:
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("QueryContext", "args", args)
 		}
 		return args[0].Value.(driver.Rows), nil
@@ -585,7 +683,7 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 		}
 		c := st.conn
 		if err = maybeBadConn(err, c); err == driver.ErrBadConn {
-			_ = st.closeNotLocking()
+			_ = st.closeNotLocking(ctx)
 		}
 		return err
 	}
@@ -593,7 +691,7 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 
 	//fmt.Printf("QueryContext(%+v)\n", args)
 	// bind variables
-	if err = st.bindVars(args, logger); err != nil {
+	if err = st.bindVars(ctx, args, logger); err != nil {
 		return nil, closeIfBadConn(err)
 	}
 
@@ -610,13 +708,38 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 	var colCount C.uint32_t
 	f := func() C.int { return C.dpiStmt_execute(st.dpiStmt, mode, &colCount) }
 	for i := 0; i < 3; i++ {
-		if err = st.checkExec(f); err == nil {
+		done := make(chan struct{})
+		if !st.conn.params.NoBreakOnContextCancel {
+			// Forcefully BREAK execution on context cancelation
+			go func() {
+				select {
+				case <-done:
+				case <-ctx.Done():
+					select {
+					case <-done:
+					default:
+						if logger != nil {
+							logger.Warn("BREAK dpiStmt_execute")
+						}
+						st.conn.Break()
+					}
+				}
+			}()
+		}
+		if err = func() error {
+			defer close(done)
+			if st.warningAsError {
+				return st.checkExecWithWarning(f)
+			} else {
+				return st.checkExec(f)
+			}
+		}(); err == nil {
 			break
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if !isInvalidErr(err) {
+		if st.noRetry || !isInvalidErr(err) {
 			break
 		}
 	}
@@ -624,7 +747,7 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 		return nil, closeIfBadConn(fmt.Errorf("dpiStmt_execute: %w", err))
 	}
 
-	rows, err := st.openRows(int(colCount))
+	rows, err := st.openRows(ctx, int(colCount))
 	return rows, closeIfBadConn(err)
 }
 
@@ -638,7 +761,7 @@ func (st *statement) queryContextNotLocked(ctx context.Context, args []driver.Na
 // its number of placeholders. In that case, the sql package
 // will not sanity check Exec or Query argument counts.
 func (st *statement) NumInput() int {
-	ctx := context.TODO()
+	ctx := context.Background()
 	logger := getLogger(ctx)
 	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("NumInput", "stmt", fmt.Sprintf("%p", st), "dpiStmt", fmt.Sprintf("%p", st.dpiStmt), "query", st.query)
@@ -721,8 +844,7 @@ type argInfo struct {
 }
 
 // bindVars binds the given args into new variables.
-func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) error {
-	ctx := context.TODO()
+func (st *statement) bindVars(ctx context.Context, args []driver.NamedValue, logger *slog.Logger) error {
 	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("enter bindVars", "st", fmt.Sprintf("%p", st), "args", fmt.Sprintf("%#v", args))
 	}
@@ -834,7 +956,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 			doManyCount = st.arrLen
 		}
 	}
-	if logger != nil {
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("bindVars", "doManyCount", doManyCount, "arrLen", st.arrLen, "doExecMany", doExecMany, "minArrLen", "maxArrLen")
 	}
 	runtime.LockOSThread()
@@ -844,7 +966,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 		value := st.dests[i]
 
 		var err error
-		if value, err = st.bindVarTypeSwitch(info, &(st.gets[i]), value); err != nil {
+		if value, err = st.bindVarTypeSwitch(ctx, info, &(st.gets[i]), value); err != nil {
 			return fmt.Errorf("%d. arg: %w", i+1, err)
 		}
 
@@ -860,7 +982,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 				n = rv.Cap()
 			}
 		}
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("newVar", "i", i, "plSQLArrays", st.PlSQLArrays(), "typ", int(info.typ), "natTyp", int(info.natTyp), "sliceLen", n, "bufSize", info.bufSize, "isSlice", st.isSlice[i])
 		}
 		//i, st.PlSQLArrays(), info.typ, info.natTyp dataSliceLen, info.bufSize)
@@ -889,7 +1011,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 		dv, data := st.vars[i], st.data[i]
 		if !info.isIn {
 			if st.PlSQLArrays() {
-				if logger != nil {
+				if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 					logger.Debug("dpiVar_setNumElementsInArray", "i", i, "n", 0)
 				}
 				if err := st.checkExecNoLOT(func() C.int { return C.dpiVar_setNumElementsInArray(dv, C.uint32_t(0)) }); err != nil {
@@ -903,7 +1025,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 				logger.Debug("set", "i", i, "value", fmt.Sprintf("%T=%#v", value, value))
 			}
-			if err := info.set(dv, data[:1], value); err != nil {
+			if err := info.set(ctx, dv, data[:1], value); err != nil {
 				return fmt.Errorf("set(data[%d][%d], %#v (%T)): %w", i, 0, value, value, err)
 			}
 			continue
@@ -912,7 +1034,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 		if st.PlSQLArrays() {
 			n = rv.Len()
 
-			if logger != nil {
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 				logger.Debug("dpiVar_setNumElementsInArray", "i", i, "n", n)
 			}
 			if err := st.checkExecNoLOT(func() C.int { return C.dpiVar_setNumElementsInArray(dv, C.uint32_t(n)) }); err != nil {
@@ -920,7 +1042,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 			}
 		}
 		//fmt.Println("n:", len(st.data[i]))
-		if err := info.set(dv, data, value); err != nil {
+		if err := info.set(ctx, dv, data, value); err != nil {
 			return err
 		}
 	}
@@ -950,8 +1072,7 @@ func (st *statement) bindVars(args []driver.NamedValue, logger *slog.Logger) err
 	return nil
 }
 
-func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value interface{}) (interface{}, error) {
-	ctx := context.TODO()
+func (st *statement) bindVarTypeSwitch(ctx context.Context, info *argInfo, get *dataGetter, value interface{}) (interface{}, error) {
 	nilPtr := false
 	logger := getLogger(ctx)
 	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
@@ -1248,11 +1369,54 @@ func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value int
 		}
 
 	default:
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("bindVarTypeSwitch default", "value", fmt.Sprintf("%T", value))
 		}
 		if !isValuer {
-			if ot, err := st.conn.getStructObjectType(value, ""); err != nil {
+			rt := reflect.TypeOf(value)
+			kind := rt.Kind()
+			if kind == reflect.Slice {
+				kind = rt.Elem().Kind()
+			}
+			switch kind {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_INT64
+				if !nilPtr {
+					info.set = dataSetNumber
+					if info.isOut {
+						*get = dataGetNumber
+					}
+				}
+				return value, nil
+
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_UINT64
+				if !nilPtr {
+					info.set = dataSetNumber
+					if info.isOut {
+						*get = dataGetNumber
+					}
+				}
+				return value, nil
+
+			case reflect.Float32:
+				info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_FLOAT, C.DPI_NATIVE_TYPE_FLOAT
+				info.set = dataSetNumber
+				if info.isOut {
+					*get = dataGetNumber
+				}
+				return value, nil
+
+			case reflect.Float64:
+				info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_DOUBLE, C.DPI_NATIVE_TYPE_DOUBLE
+				info.set = dataSetNumber
+				if info.isOut {
+					*get = dataGetNumber
+				}
+				return value, nil
+			}
+
+			if ot, err := st.conn.getStructObjectType(ctx, value, ""); err != nil {
 				if logger != nil {
 					logger.Error("getStructObjectType", "value", fmt.Sprintf("%T", value), "error", err)
 				}
@@ -1262,12 +1426,12 @@ func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value int
 			} else {
 				info.objType = ot.dpiObjectType
 				info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
-				info.set = func(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
-					return st.dataSetObjectStruct(ot, dv, &data[0], vv)
+				info.set = func(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+					return st.dataSetObjectStruct(ctx, ot, dv, &data[0], vv)
 				}
 				if info.isOut {
-					*get = func(v interface{}, data []C.dpiData) error {
-						return st.dataGetObjectStruct(ot, v, data)
+					*get = func(ctx context.Context, v interface{}, data []C.dpiData) error {
+						return st.dataGetObjectStruct(ctx, ot, v, data)
 					}
 				}
 				return value, nil
@@ -1282,21 +1446,21 @@ func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value int
 		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("valuer", "old", fmt.Sprintf("[%T]%#v.Value()", oval, oval), "new", fmt.Sprintf("[%T]%#v", value, value))
 		}
-		return st.bindVarTypeSwitch(info, get, value)
+		return st.bindVarTypeSwitch(ctx, info, get, value)
 	}
 
 	return value, nil
 }
 
-type dataSetter func(dv *C.dpiVar, data []C.dpiData, vv interface{}) error
+type dataSetter func(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error
 
-func dataSetNull(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func dataSetNull(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	for i := range data {
 		data[i].isNull = 1
 	}
 	return nil
 }
-func dataGetBool(v interface{}, data []C.dpiData) error {
+func dataGetBool(ctx context.Context, v interface{}, data []C.dpiData) error {
 	if b, ok := v.(*bool); ok {
 		if len(data) == 0 || data[0].isNull == 1 {
 			*b = false
@@ -1322,9 +1486,9 @@ func dataGetBool(v interface{}, data []C.dpiData) error {
 	}
 	return nil
 }
-func dataSetBool(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func dataSetBool(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	b := C.int(0)
 	if v, ok := vv.(bool); ok {
@@ -1351,21 +1515,21 @@ func dataSetBool(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 
 var _ = sql.Scanner((*NullTime)(nil))
 
-func (c *conn) dataGetTime(v interface{}, data []C.dpiData) error {
+func (c *conn) dataGetTime(ctx context.Context, v interface{}, data []C.dpiData) error {
 	switch x := v.(type) {
 	case *time.Time:
 		if len(data) == 0 || data[0].isNull == 1 {
 			*x = time.Time{}
 			return nil
 		}
-		c.dataGetTimeC(x, &data[0])
+		c.dataGetTimeC(ctx, x, &data[0])
 	case *timestamppb.Timestamp:
 		if len(data) == 0 || data[0].isNull == 1 {
 			x.Reset()
 			return nil
 		}
 		var t time.Time
-		c.dataGetTimeC(&t, &data[0])
+		c.dataGetTimeC(ctx, &t, &data[0])
 		if t.IsZero() {
 			x.Reset()
 		} else {
@@ -1374,7 +1538,7 @@ func (c *conn) dataGetTime(v interface{}, data []C.dpiData) error {
 
 	case *NullTime:
 		if x.Valid = !(len(data) == 0 || data[0].isNull == 1); x.Valid {
-			c.dataGetTimeC(&x.Time, &data[0])
+			c.dataGetTimeC(ctx, &x.Time, &data[0])
 		}
 
 	case *[]time.Time:
@@ -1385,7 +1549,7 @@ func (c *conn) dataGetTime(v interface{}, data []C.dpiData) error {
 			*x = make([]time.Time, n)
 		}
 		for i := range data {
-			c.dataGetTimeC(&((*x)[i]), &data[i])
+			c.dataGetTimeC(ctx, &((*x)[i]), &data[i])
 		}
 	case *[]*timestamppb.Timestamp:
 		n := len(data)
@@ -1396,7 +1560,7 @@ func (c *conn) dataGetTime(v interface{}, data []C.dpiData) error {
 		}
 		for i := range data {
 			var t time.Time
-			c.dataGetTimeC(&t, &data[i])
+			c.dataGetTimeC(ctx, &t, &data[i])
 			if t.IsZero() {
 				(*x)[i].Reset()
 			} else {
@@ -1416,7 +1580,7 @@ func (c *conn) dataGetTime(v interface{}, data []C.dpiData) error {
 		}
 		for i := range data {
 			if (*x)[i].Valid = !(data[i].isNull == 1); (*x)[i].Valid {
-				c.dataGetTimeC(&((*x)[i].Time), &data[i])
+				c.dataGetTimeC(ctx, &((*x)[i].Time), &data[i])
 			}
 		}
 
@@ -1428,7 +1592,7 @@ func (c *conn) dataGetTime(v interface{}, data []C.dpiData) error {
 
 var errUnknownType = errors.New("unknown type")
 
-func (c *conn) dataGetTimeC(t *time.Time, data *C.dpiData) {
+func (c *conn) dataGetTimeC(ctx context.Context, t *time.Time, data *C.dpiData) {
 	if data.isNull == 1 {
 		*t = time.Time{}
 		return
@@ -1444,9 +1608,9 @@ func (c *conn) dataGetTimeC(t *time.Time, data *C.dpiData) {
 
 var date8192begin, date8192end = time.Date(0, time.December, 31, 0, 0, 0, 0, time.UTC), time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC)
 
-func (c *conn) dataSetTime(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetTime(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	times := []time.Time{{}}
 	switch x := vv.(type) {
@@ -1498,14 +1662,14 @@ func (c *conn) dataSetTime(dv *C.dpiVar, data []C.dpiData, vv interface{}) error
 		if data[i].isNull == 1 {
 			continue
 		}
-		dataSetTime(&data[i], t, tz)
+		dataSetTime(ctx, &data[i], t, tz)
 	}
 	return nil
 }
 
-func (c *conn) dataGetIntervalDS(v interface{}, data []C.dpiData) error {
-	logger := getLogger(context.TODO())
-	if logger != nil {
+func (c *conn) dataGetIntervalDS(ctx context.Context, v interface{}, data []C.dpiData) error {
+	logger := getLogger(ctx)
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("dataGetIntervalDS", "data", data, "v", v)
 	}
 	switch x := v.(type) {
@@ -1514,7 +1678,7 @@ func (c *conn) dataGetIntervalDS(v interface{}, data []C.dpiData) error {
 			*x = 0
 			return nil
 		}
-		dataGetIntervalDS(x, &data[0])
+		dataGetIntervalDS(ctx, x, &data[0])
 
 	case *[]time.Duration:
 		n := len(data)
@@ -1524,13 +1688,13 @@ func (c *conn) dataGetIntervalDS(v interface{}, data []C.dpiData) error {
 			*x = make([]time.Duration, n)
 		}
 		for i := range data {
-			dataGetIntervalDS(&((*x)[i]), &data[i])
+			dataGetIntervalDS(ctx, &((*x)[i]), &data[i])
 		}
 	}
 	return nil
 }
 
-func dataGetIntervalDS(t *time.Duration, d *C.dpiData) {
+func dataGetIntervalDS(ctx context.Context, t *time.Duration, d *C.dpiData) {
 	//ds := C.dpiData_getIntervalDS(d)
 	ds := *((*C.dpiIntervalDS)(unsafe.Pointer(&d.value)))
 	*t = time.Duration(ds.days)*24*time.Hour +
@@ -1538,14 +1702,14 @@ func dataGetIntervalDS(t *time.Duration, d *C.dpiData) {
 		time.Duration(ds.minutes)*time.Minute +
 		time.Duration(ds.seconds)*time.Second +
 		time.Duration(ds.fseconds)
-	if logger := getLogger(context.TODO()); logger != nil {
+	if logger := getLogger(ctx); logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("dataGetIntervalDS", "d", *d, "t", *t)
 	}
 }
 
-func (c *conn) dataSetIntervalDS(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetIntervalDS(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	times := []time.Duration{0}
 	switch x := vv.(type) {
@@ -1565,8 +1729,8 @@ func (c *conn) dataSetIntervalDS(dv *C.dpiVar, data []C.dpiData, vv interface{})
 		}
 		return nil
 	}
-	logger := getLogger(context.TODO())
-	if logger != nil {
+	logger := getLogger(ctx)
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("dataSetIntervalDS", "data", data, "times", times)
 	}
 
@@ -1583,18 +1747,18 @@ func (c *conn) dataSetIntervalDS(dv *C.dpiVar, data []C.dpiData, vv interface{})
 		t, rem = rem, t%time.Second
 		s := C.int32_t(t / time.Second)
 		fs := C.int32_t(rem)
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("dataSetIntervalDS", "i", i, "t", t, "day", d, "hour", h, "minute", m, "second", s, "fsecond", fs)
 		}
 		C.dpiData_setIntervalDS(&data[i], d, h, m, s, fs)
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("dataSetIntervalDS", "i", i, "t", t, "data", data[i])
 		}
 	}
 	return nil
 }
 
-func dataGetNumber(v interface{}, data []C.dpiData) error {
+func dataGetNumber(ctx context.Context, v interface{}, data []C.dpiData) error {
 	switch x := v.(type) {
 	case *int:
 		if len(data) == 0 || data[0].isNull == 1 {
@@ -1858,9 +2022,25 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 		}
 
 	case *Number, *[]Number, decimalCompose, *[]decimalCompose:
-		return dataGetBytes(x, data)
+		return dataGetBytes(ctx, x, data)
 
 	default:
+		rv := reflect.ValueOf(v)
+		switch rv.Type().Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			x := reflect.ValueOf(new(int64)).Elem()
+			x.SetInt(rv.Int())
+			return dataGetNumber(ctx, x.Interface(), data)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			x := reflect.ValueOf(new(uint64)).Elem()
+			x.SetUint(rv.Uint())
+			return dataGetNumber(ctx, x.Interface(), data)
+		case reflect.Float32, reflect.Float64:
+			x := reflect.ValueOf(new(float64)).Elem()
+			x.SetFloat(rv.Float())
+			return dataGetNumber(ctx, x.Interface(), data)
+		}
+
 		return fmt.Errorf("unknown number [%T] %#v", v, v)
 	}
 
@@ -1868,12 +2048,12 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 	return nil
 }
 
-func dataSetNumber(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func dataSetNumber(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	switch slice := vv.(type) {
 	case int:
@@ -2015,9 +2195,25 @@ func dataSetNumber(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 		}
 
 	case Number, []Number, decimalDecompose, []decimalDecompose, string, []string:
-		return dataSetBytes(dv, data, vv)
+		return dataSetBytes(ctx, dv, data, vv)
 
 	default:
+		rv := reflect.ValueOf(vv)
+		switch rv.Type().Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			x := reflect.ValueOf(new(int64)).Elem()
+			x.SetInt(rv.Int())
+			return dataSetNumber(ctx, dv, data, x.Interface())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			x := reflect.ValueOf(new(uint64)).Elem()
+			x.SetUint(rv.Uint())
+			return dataSetNumber(ctx, dv, data, x.Interface())
+		case reflect.Float32, reflect.Float64:
+			x := reflect.ValueOf(new(float64)).Elem()
+			x.SetFloat(rv.Float())
+			return dataSetNumber(ctx, dv, data, x.Interface())
+		}
+
 		return fmt.Errorf("unknown number slice [%T] %#v", vv, vv)
 	}
 
@@ -2025,7 +2221,7 @@ func dataSetNumber(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	return nil
 }
 
-func dataGetBytes(v interface{}, data []C.dpiData) error {
+func dataGetBytes(ctx context.Context, v interface{}, data []C.dpiData) error {
 	switch x := v.(type) {
 	case *[]byte:
 		if len(data) == 0 || data[0].isNull == 1 {
@@ -2158,46 +2354,46 @@ func dataGetBytes(v interface{}, data []C.dpiData) error {
 	case *interface{}:
 		switch y := (*x).(type) {
 		case []byte:
-			err := dataGetBytes(&y, data[:1])
+			err := dataGetBytes(ctx, &y, data[:1])
 			*x = y
 			return err
 		case [][]byte:
-			err := dataGetBytes(&y, data)
+			err := dataGetBytes(ctx, &y, data)
 			*x = y
 			return err
 
 		case Number:
-			err := dataGetBytes(&y, data[:1])
+			err := dataGetBytes(ctx, &y, data[:1])
 			*x = y
 			return err
 		case []Number:
-			err := dataGetBytes(&y, data)
+			err := dataGetBytes(ctx, &y, data)
 			*x = y
 			return err
 
 		case string:
-			err := dataGetBytes(&y, data[:1])
+			err := dataGetBytes(ctx, &y, data[:1])
 			*x = y
 			return err
 		case []string:
-			err := dataGetBytes(&y, data)
+			err := dataGetBytes(ctx, &y, data)
 			*x = y
 			return err
 
 		case sql.NullInt32:
-			err := dataGetBytes(&y, data[:1])
+			err := dataGetBytes(ctx, &y, data[:1])
 			*x = y
 			return err
 		case []sql.NullInt32:
-			err := dataGetBytes(&y, data)
+			err := dataGetBytes(ctx, &y, data)
 			*x = y
 			return err
 		case sql.NullInt64:
-			err := dataGetBytes(&y, data[:1])
+			err := dataGetBytes(ctx, &y, data[:1])
 			*x = y
 			return err
 		case []sql.NullInt64:
-			err := dataGetBytes(&y, data)
+			err := dataGetBytes(ctx, &y, data)
 			*x = y
 			return err
 
@@ -2211,12 +2407,12 @@ func dataGetBytes(v interface{}, data []C.dpiData) error {
 	return nil
 }
 
-func dataSetBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func dataSetBytes(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	var p *C.char
 	switch slice := vv.(type) {
@@ -2311,7 +2507,7 @@ func dataSetBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	return nil
 }
 
-func (st *statement) dataGetBoolBytes(v interface{}, data []C.dpiData) error {
+func (st *statement) dataGetBoolBytes(ctx context.Context, v interface{}, data []C.dpiData) error {
 	switch x := v.(type) {
 	case *bool:
 		if len(data) == 0 || data[0].isNull == 1 {
@@ -2333,11 +2529,11 @@ func (st *statement) dataGetBoolBytes(v interface{}, data []C.dpiData) error {
 	case *interface{}:
 		switch y := (*x).(type) {
 		case bool:
-			err := st.dataGetBoolBytes(&y, data[:1])
+			err := st.dataGetBoolBytes(ctx, &y, data[:1])
 			*x = y
 			return err
 		case []bool:
-			err := st.dataGetBoolBytes(&y, data)
+			err := st.dataGetBoolBytes(ctx, &y, data)
 			*x = y
 			return err
 
@@ -2350,12 +2546,12 @@ func (st *statement) dataGetBoolBytes(v interface{}, data []C.dpiData) error {
 	}
 	return nil
 }
-func (st *statement) dataSetBoolBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (st *statement) dataSetBoolBytes(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	var p *C.char
 	switch slice := vv.(type) {
@@ -2379,13 +2575,13 @@ func (st *statement) dataSetBoolBytes(dv *C.dpiVar, data []C.dpiData, vv interfa
 	return nil
 }
 
-func (st *statement) dataGetStmt(v interface{}, data []C.dpiData) error {
+func (st *statement) dataGetStmt(ctx context.Context, v interface{}, data []C.dpiData) error {
 	if row, ok := v.(*driver.Rows); ok {
 		if len(data) == 0 || data[0].isNull == 1 {
 			*row = nil
 			return nil
 		}
-		return st.dataGetStmtC(row, &data[0])
+		return st.dataGetStmtC(ctx, row, &data[0])
 	}
 	rows := v.(*[]driver.Rows)
 	if cap(*rows) >= len(data) {
@@ -2395,14 +2591,14 @@ func (st *statement) dataGetStmt(v interface{}, data []C.dpiData) error {
 	}
 	var firstErr error
 	for i := range data {
-		if err := st.dataGetStmtC(&((*rows)[i]), &data[i]); err != nil && firstErr == nil {
+		if err := st.dataGetStmtC(ctx, &((*rows)[i]), &data[i]); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
 }
 
-func (st *statement) dataGetStmtC(row *driver.Rows, data *C.dpiData) error {
+func (st *statement) dataGetStmtC(ctx context.Context, row *driver.Rows, data *C.dpiData) error {
 	if data.isNull == 1 {
 		*row = nil
 		return nil
@@ -2411,7 +2607,6 @@ func (st *statement) dataGetStmtC(row *driver.Rows, data *C.dpiData) error {
 		stmtOptions: st.stmtOptions, // inherit parent statement's options
 	}
 
-	ctx := context.TODO()
 	logger := getLogger(ctx)
 	var n C.uint32_t
 	if err := st.checkExec(func() C.int { return C.dpiStmt_getNumQueryColumns(st2.dpiStmt, &n) }); err != nil {
@@ -2422,7 +2617,7 @@ func (st *statement) dataGetStmtC(row *driver.Rows, data *C.dpiData) error {
 		}
 		return nil
 	}
-	r2, err := st2.openRows(int(n))
+	r2, err := st2.openRows(ctx, int(n))
 	if err != nil {
 		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Error("dataGetStmtC.openRows", "st", fmt.Sprintf("%p", st2.dpiStmt), "error", err)
@@ -2430,19 +2625,19 @@ func (st *statement) dataGetStmtC(row *driver.Rows, data *C.dpiData) error {
 		st2.Close()
 		return err
 	}
-	stmtSetFinalizer(st2, "dataGetStmtC")
+	stmtSetFinalizer(ctx, st2, "dataGetStmtC")
 	r2.fromData = true
 	*row = r2
 	return nil
 }
 
-func (c *conn) dataGetLOB(v interface{}, data []C.dpiData) error {
+func (c *conn) dataGetLOB(ctx context.Context, v interface{}, data []C.dpiData) error {
 	if L, ok := v.(*Lob); ok {
 		if len(data) == 0 || data[0].isNull == 1 {
 			*L = Lob{}
 			return nil
 		}
-		c.dataGetLOBC(L, &data[0])
+		c.dataGetLOBC(ctx, L, &data[0])
 		return nil
 	}
 	slice := v.(*[]Lob)
@@ -2453,11 +2648,11 @@ func (c *conn) dataGetLOB(v interface{}, data []C.dpiData) error {
 		*slice = make([]Lob, n)
 	}
 	for i := range data {
-		c.dataGetLOBC(&((*slice)[i]), &data[i])
+		c.dataGetLOBC(ctx, &((*slice)[i]), &data[i])
 	}
 	return nil
 }
-func (c *conn) dataGetLOBC(L *Lob, data *C.dpiData) {
+func (c *conn) dataGetLOBC(ctx context.Context, L *Lob, data *C.dpiData) {
 	L.Reader = nil
 	if data.isNull == 1 {
 		return
@@ -2469,12 +2664,12 @@ func (c *conn) dataGetLOBC(L *Lob, data *C.dpiData) {
 	L.Reader = &dpiLobReader{drv: c.drv, dpiLob: lob, IsClob: L.IsClob}
 }
 
-func (c *conn) dataSetLOB(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetLOB(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 
 	lobs := []Lob{{}}
@@ -2485,7 +2680,7 @@ func (c *conn) dataSetLOB(dv *C.dpiVar, data []C.dpiData, vv interface{}) error 
 	}
 	var firstErr error
 	for i, L := range lobs {
-		if err := c.dataSetLOBOne(dv, data, i, L); err != nil {
+		if err := c.dataSetLOBOne(ctx, dv, data, i, L); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("%d. %w", i, err)
 			}
@@ -2493,7 +2688,7 @@ func (c *conn) dataSetLOB(dv *C.dpiVar, data []C.dpiData, vv interface{}) error 
 	}
 	return firstErr
 }
-func (c *conn) dataSetLOBOne(dv *C.dpiVar, data []C.dpiData, i int, L Lob) error {
+func (c *conn) dataSetLOBOne(ctx context.Context, dv *C.dpiVar, data []C.dpiData, i int, L Lob) error {
 	if L.Reader == nil {
 		data[i].isNull = 1
 		return nil
@@ -2506,16 +2701,15 @@ func (c *conn) dataSetLOBOne(dv *C.dpiVar, data []C.dpiData, i int, L Lob) error
 		return nil
 	}
 
-	ctx := context.TODO()
 	logger := getLogger(ctx)
 
 	// For small reads it is faster to set it as byte slice
 	var a [1 << 20]byte
-	n, _ := io.ReadFull(L.Reader, a[:])
-	if logger != nil {
-		logger.Debug("setLob", "n", n)
+	n, _ := io.ReadAtLeast(L.Reader, a[:], cap(a)>>1)
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
+		logger.Debug("ReadAtLeast", "wanted", cap(a)>>1, "n", n, "isClob", L.IsClob)
 	}
-	if n < cap(a) {
+	if n < cap(a)>>1 {
 		if err := c.checkExec(func() C.int {
 			return C.dpiVar_setFromBytes(dv, C.uint32_t(i), (*C.char)(unsafe.Pointer(&a[0])), C.uint32_t(n))
 		}); err != nil {
@@ -2549,22 +2743,25 @@ func (c *conn) dataSetLOBOne(dv *C.dpiVar, data []C.dpiData, i int, L Lob) error
 		logger.Debug("setLOB", "written", written, "tempLob", fmt.Sprintf("%p", lob), "chunkSize", chunkSize, "error", err)
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("written %d into isClob=%t: %w", written, L.IsClob, err)
 	}
-	{
-		var lobType C.dpiOracleTypeNum
+	// for historical reasons, Oracle stores CLOBs and NCLOBs using the UTF-16 encoding, regardless of what encoding is otherwise in use by the database. The number of characters, however, is defined by the number of UCS-2 codepoints. For this reason, if a character requires more than one UCS-2 codepoint, the size returned will be inaccurate and care must be taken to account for the difference.
+	if !L.IsClob {
 		var lobSize C.uint64_t
-		err := c.checkExec(func() C.int {
-			if rc := C.dpiLob_getType(lob, &lobType); rc != 0 {
-				return rc
+		if err := c.checkExec(func() C.int { return C.dpiLob_getSize(lob, &lobSize) }); err != nil {
+			if logger != nil {
+				logger.Error("setLOB", "type", typ, "error", err)
 			}
-			return C.dpiLob_getSize(lob, &lobSize)
-		})
-		if logger != nil {
-			logger.Debug("setLOB", "type", lobType, "size", lobSize, "error", err)
-		}
-		if int64(lobSize) != int64(written) {
-			return fmt.Errorf("lobSize=%d, wanted %d", lobSize, written)
+		} else {
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
+				logger.Debug("setLOB", "type", typ, "size", lobSize, "error", err)
+			}
+			if int64(lobSize) != int64(written) {
+				if logger != nil {
+					logger.Warn("write LOB", "isClob", L.IsClob, "wanted", lobSize, "written", written)
+				}
+				return fmt.Errorf("lobSize=%d, wanted %d", lobSize, written)
+			}
 		}
 	}
 	if err = c.checkExec(func() C.int { return C.dpiVar_setFromLob(dv, C.uint32_t(i), lob) }); err != nil {
@@ -2589,13 +2786,13 @@ type ObjectWriter interface {
 	userType
 }
 
-func (c *conn) dataSetObject(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetObject(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	//fmt.Printf("\ndataSetObject(dv=%+v, data=%+v, vv=%+v)\n", dv, data, vv)
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	objs := []Object{{}}
 	switch o := vv.(type) {
@@ -2645,8 +2842,8 @@ func (c *conn) dataSetObject(dv *C.dpiVar, data []C.dpiData, vv interface{}) err
 }
 
 // dataSetObjectStructObj creates an ot typed object from rv.
-func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object, error) {
-	logger := getLogger(context.TODO())
+func (c *conn) dataSetObjectStructObj(ctx context.Context, ot *ObjectType, rv reflect.Value) (*Object, error) {
+	logger := getLogger(ctx)
 	if rv.Type().Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
@@ -2655,7 +2852,7 @@ func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object
 	}
 	rvt := rv.Type()
 	wrappedSlice := ot.CollectionOf != nil && rvt.Kind() == reflect.Struct
-	if logger != nil {
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("dataSetObjectStructObj", "ot", ot.FullName(), "rvt", rvt, "kind", rvt.Kind(), "wrappedSlice", wrappedSlice)
 	}
 	if wrappedSlice {
@@ -2675,11 +2872,11 @@ func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object
 		if err != nil {
 			return nil, err
 		}
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("dataSetObjectStructObj", "collection", coll)
 		}
 		for i, n := 0, rv.Len(); i < n; i++ {
-			if logger != nil {
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 				logger.Debug("dataSetObjectStructObj", "i", i, "collectionOf", ot.CollectionOf, "elt", rv.Index(i).Interface())
 			}
 			if !ot.CollectionOf.IsObject() {
@@ -2687,7 +2884,7 @@ func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object
 					return nil, fmt.Errorf("append %T[%d] to %s: %w", rv.Index(i).Interface(), i, coll.FullName(), err)
 				}
 			} else {
-				sub, err := c.dataSetObjectStructObj(ot.CollectionOf, rv.Index(i))
+				sub, err := c.dataSetObjectStructObj(ctx, ot.CollectionOf, rv.Index(i))
 				if err != nil {
 					return nil, fmt.Errorf("%d. dataSetObjectStructObj: %w", i, err)
 				}
@@ -2712,10 +2909,10 @@ func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object
 				if f.Type.Kind() != reflect.Slice {
 					continue
 				}
-				if logger != nil {
+				if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 					logger.Debug("dataSetObjectStructObj", "sliceInStruct", f.Name, "ot", ot.FullName(), "rf", rf.Interface())
 				}
-				return c.dataSetObjectStructObj(ot, rf)
+				return c.dataSetObjectStructObj(ctx, ot, rf)
 			}
 		}
 
@@ -2755,10 +2952,10 @@ func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object
 						return nil, err
 					}
 				}
-				if logger != nil {
+				if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 					logger.Debug("dataSetObjectStructObj", "name", nm, "tag", f.Tag, "ot", ot, "typ", typ)
 				}
-				sub, err := c.dataSetObjectStructObj(ot, rf)
+				sub, err := c.dataSetObjectStructObj(ctx, ot, rf)
 				if err != nil {
 					return nil, err
 				}
@@ -2786,11 +2983,10 @@ func (c *conn) dataSetObjectStructObj(ot *ObjectType, rv reflect.Value) (*Object
 }
 
 // dataSetObjectStruct reads from vv, writes it to an ot typed object, and puts it into data.
-func (c *conn) dataSetObjectStruct(ot *ObjectType, dv *C.dpiVar, data *C.dpiData, vv interface{}) error {
+func (c *conn) dataSetObjectStruct(ctx context.Context, ot *ObjectType, dv *C.dpiVar, data *C.dpiData, vv interface{}) error {
 	if ot == nil {
 		panic("dataSetObjectStruct with nil ObjectType")
 	}
-	ctx := context.TODO()
 	logger := getLogger(ctx)
 	rv := reflect.ValueOf(vv)
 	if rv.Type().Kind() == reflect.Ptr {
@@ -2802,7 +2998,7 @@ func (c *conn) dataSetObjectStruct(ot *ObjectType, dv *C.dpiVar, data *C.dpiData
 	if vv == nil || rv.IsZero() {
 		return nil
 	}
-	obj, err := c.dataSetObjectStructObj(ot, rv)
+	obj, err := c.dataSetObjectStructObj(ctx, ot, rv)
 	if err != nil {
 		return err
 	}
@@ -2820,8 +3016,7 @@ func (c *conn) dataSetObjectStruct(ot *ObjectType, dv *C.dpiVar, data *C.dpiData
 	}
 	return obj.Close()
 }
-func (c *conn) dataGetObject(v interface{}, data []C.dpiData) error {
-	ctx := context.TODO()
+func (c *conn) dataGetObject(ctx context.Context, v interface{}, data []C.dpiData) error {
 	logger := getLogger(ctx)
 	switch out := v.(type) {
 	case *ObjectCollection:
@@ -2875,8 +3070,8 @@ func (c *conn) dataGetObject(v interface{}, data []C.dpiData) error {
 }
 
 // dataGetObjectStructObj reads an object and writes it to rv.
-func (c *conn) dataGetObjectStructObj(rv reflect.Value, obj *Object) error {
-	logger := getLogger(context.TODO())
+func (c *conn) dataGetObjectStructObj(ctx context.Context, rv reflect.Value, obj *Object) error {
+	logger := getLogger(ctx)
 	rvt := rv.Type()
 
 	if obj == nil {
@@ -2887,12 +3082,12 @@ func (c *conn) dataGetObjectStructObj(rv reflect.Value, obj *Object) error {
 		}
 		return nil
 	}
-	if logger != nil {
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("dataGetObjectStructObj", "kind", rvt.Kind(), "collectionOf", obj.CollectionOf)
 	}
 	if obj.CollectionOf != nil && rvt.Kind() == reflect.Slice {
 		coll := obj.Collection()
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			length, _ := coll.Len()
 			logger.Debug("dataGetObjectStructObj", "length", length, "cap", rv.Cap())
 		}
@@ -2914,7 +3109,7 @@ func (c *conn) dataGetObjectStructObj(rv reflect.Value, obj *Object) error {
 				if err != nil {
 					return err
 				}
-				if rv.Cap() < length {
+				if true || rv.Cap() < length { // Forcing new slice helps #323
 					rv = reflect.MakeSlice(rvt, 0, length)
 				}
 			}
@@ -2922,9 +3117,13 @@ func (c *conn) dataGetObjectStructObj(rv reflect.Value, obj *Object) error {
 			if err := coll.GetItem(&d, i); err != nil {
 				return err
 			}
-			switch x := d.Get().(type) {
+			x := d.Get()
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
+				logger.Debug("coll.GetItem", "i", i, "x", x, "x.type", fmt.Sprintf("%T", x))
+			}
+			switch x := x.(type) {
 			case *Object:
-				err := c.dataGetObjectStructObj(re, x)
+				err := c.dataGetObjectStructObj(ctx, re, x)
 				x.Close()
 				if err != nil {
 					return err
@@ -2935,11 +3134,14 @@ func (c *conn) dataGetObjectStructObj(rv reflect.Value, obj *Object) error {
 					ev = ev.Convert(ret)
 				}
 				re.Set(ev)
+				if c, ok := x.(io.Closer); ok {
+					c.Close()
+				}
 			}
 			rv = reflect.Append(rv, re)
 		}
 		orig.Set(rv)
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			length, _ := coll.Len()
 			logger.Debug("dataGetObjectStructObj", "coll", length, "rv", orig.Len())
 		}
@@ -2958,7 +3160,10 @@ Loop:
 			if f.Type.Kind() != reflect.Slice {
 				continue
 			}
-			return c.dataGetObjectStructObj(rf, obj)
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
+				logger.Debug("dataGetObjectStructObj", "field", f)
+			}
+			return c.dataGetObjectStructObj(ctx, rf, obj)
 		}
 		nm, typ, _ := parseStructTag(f.Tag)
 		if nm == "-" {
@@ -2968,7 +3173,7 @@ Loop:
 		if fieldTag == "" {
 			fieldTag = nm
 		}
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("dataGetObjectStruct", "fieldTag", fieldTag, "nm", nm, "tag", f.Tag, "name", f.Name)
 		}
 
@@ -2983,11 +3188,15 @@ Loop:
 			rf.SetZero()
 			continue
 		}
-		switch v := ad.Get().(type) {
+		x := ad.Get()
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
+			logger.Debug("dataGetObjectStructObj.GetAttribute", "name", nm, "x", x, "x.type", fmt.Sprintf("%T", x))
+		}
+		switch v := x.(type) {
 		case time.Time:
 			rf.Set(reflect.ValueOf(v))
 		case *Object:
-			err := c.dataGetObjectStructObj(rf, v)
+			err := c.dataGetObjectStructObj(ctx, rf, v)
 			v.Close()
 			if err != nil {
 				return err
@@ -3012,13 +3221,18 @@ Loop:
 					return fmt.Errorf("GetLobAttribute(%q): %w", nm, err)
 				}
 			}
+			if c, ok := x.(io.Closer); ok {
+				c.Close()
+			} else if c, ok := v.Reader.(io.Closer); ok {
+				c.Close()
+			}
 			if rf.Kind() == reflect.String {
 				rf.SetString(buf.String())
 			} else {
 				rf.SetBytes(buf.Bytes())
 			}
 		default:
-			if logger != nil {
+			if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 				logger.Debug("set", "src", fmt.Sprintf("%#v", v), "dst", rf)
 			}
 			switch vv := reflect.ValueOf(v); vv.Kind() {
@@ -3054,16 +3268,16 @@ Loop:
 			default:
 				// TODO: slice/Collection of sth
 				if kind := vv.Kind(); kind == reflect.Struct || (kind == reflect.Ptr && vv.Elem().Kind() == reflect.Struct) {
-					if err := c.dataGetObjectStruct(obj.ObjectType.Attributes[nm].ObjectType, v, []C.dpiData{ad.dpiData}); err != nil {
+					if err := c.dataGetObjectStruct(ctx, obj.ObjectType.Attributes[nm].ObjectType, v, []C.dpiData{ad.dpiData}); err != nil {
 						return err
 					}
 				} else if kind == reflect.Slice &&
 					(vv.Elem().Kind() == reflect.Struct || (vv.Elem().Kind() == reflect.Ptr && vv.Elem().Elem().Kind() == reflect.Struct)) {
-					ot, err := c.getStructObjectType(v, fieldTag)
+					ot, err := c.getStructObjectType(ctx, v, fieldTag)
 					if err != nil {
 						return err
 					}
-					if err := c.dataGetObjectStruct(ot, v, []C.dpiData{ad.dpiData}); err != nil {
+					if err := c.dataGetObjectStruct(ctx, ot, v, []C.dpiData{ad.dpiData}); err != nil {
 						return err
 					}
 				} else {
@@ -3079,8 +3293,7 @@ Loop:
 }
 
 // dataGetObjectStruct reads the object from data and writes it to v.
-func (c *conn) dataGetObjectStruct(ot *ObjectType, v interface{}, data []C.dpiData) error {
-	ctx := context.TODO()
+func (c *conn) dataGetObjectStruct(ctx context.Context, ot *ObjectType, v interface{}, data []C.dpiData) error {
 	logger := getLogger(ctx)
 	// Pointer to a struct with ObjectTypeName field and optional "godror" struct tags for struct field-object attribute mapping.
 	rv := reflect.ValueOf(v)
@@ -3103,7 +3316,7 @@ func (c *conn) dataGetObjectStruct(ot *ObjectType, v interface{}, data []C.dpiDa
 		rv.Set(reflect.ValueOf(d.GetTime()))
 		return nil
 	}
-	err := c.dataGetObjectStructObj(rv, obj)
+	err := c.dataGetObjectStructObj(ctx, rv, obj)
 	obj.Close()
 	return err
 }
@@ -3138,8 +3351,8 @@ func parseStructTag(s reflect.StructTag) (tag, typ string, opts map[string]strin
 // StructTag is the prefix that tags godror-specific struct fields
 const StructTag = "godror"
 
-func (c *conn) getStructObjectType(v interface{}, fieldTag string) (*ObjectType, error) {
-	logger := getLogger(context.TODO())
+func (c *conn) getStructObjectType(ctx context.Context, v interface{}, fieldTag string) (*ObjectType, error) {
+	logger := getLogger(ctx)
 	rv := reflect.ValueOf(v)
 	if rv.Type().Kind() == reflect.Ptr {
 		rv = rv.Elem()
@@ -3147,7 +3360,7 @@ func (c *conn) getStructObjectType(v interface{}, fieldTag string) (*ObjectType,
 	rvt := rv.Type()
 	switch rvt.Kind() {
 	case reflect.Slice:
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("getStructObjectType", "fieldTag", fieldTag)
 		}
 		return c.GetObjectType(fieldTag)
@@ -3183,7 +3396,7 @@ func (c *conn) getStructObjectType(v interface{}, fieldTag string) (*ObjectType,
 		if otName == "" {
 			return nil, fmt.Errorf("%T: no ObjectTypeName specified: %w", v, errUnknownType)
 		}
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("parseStructTag", "name", otName)
 		}
 		return c.GetObjectType(otName)
@@ -3200,7 +3413,7 @@ func fieldIsObjectTypeName(f reflect.StructField) bool {
 	return f.Name == otnName || f.Type == otnType
 }
 
-func (c *conn) dataGetJSON(v interface{}, data []C.dpiData) error {
+func (c *conn) dataGetJSON(ctx context.Context, v interface{}, data []C.dpiData) error {
 
 	switch out := v.(type) {
 	case *JSON:
@@ -3211,13 +3424,13 @@ func (c *conn) dataGetJSON(v interface{}, data []C.dpiData) error {
 	return nil
 }
 
-func (c *conn) dataSetJSON(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetJSON(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
 	}
 	i := 0
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	switch x := vv.(type) {
 	case JSON:
@@ -3234,13 +3447,13 @@ func (c *conn) dataSetJSON(dv *C.dpiVar, data []C.dpiData, vv interface{}) error
 	return nil
 }
 
-func (c *conn) dataSetJSONValue(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetJSONValue(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	var err error = nil
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	switch x := vv.(type) {
 	case JSONValue:
@@ -3296,7 +3509,7 @@ func (c *conn) dataSetJSONValue(dv *C.dpiVar, data []C.dpiData, vv interface{}) 
 	return err
 }
 
-func (c *conn) dataGetJSONValue(v interface{}, data []C.dpiData) error {
+func (c *conn) dataGetJSONValue(ctx context.Context, v interface{}, data []C.dpiData) error {
 	switch out := v.(type) {
 	case *JSON:
 		*out = JSON{dpiJson: (*(**C.dpiJson)(unsafe.Pointer(&(data[0].value))))}
@@ -3306,12 +3519,12 @@ func (c *conn) dataGetJSONValue(v interface{}, data []C.dpiData) error {
 	return nil
 }
 
-func (c *conn) dataSetJSONString(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
+func (c *conn) dataSetJSONString(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 	if len(data) == 0 {
 		return nil
 	}
 	if vv == nil {
-		return dataSetNull(dv, data, nil)
+		return dataSetNull(ctx, dv, data, nil)
 	}
 	switch js := vv.(type) {
 	case JSONString:
@@ -3348,7 +3561,7 @@ func (c *conn) dataSetJSONString(dv *C.dpiVar, data []C.dpiData, vv interface{})
 	return nil
 }
 
-func (c *conn) dataGetJSONString(v interface{}, data []C.dpiData) error {
+func (c *conn) dataGetJSONString(ctx context.Context, v interface{}, data []C.dpiData) error {
 
 	switch out := v.(type) {
 	case *string:
@@ -3407,14 +3620,15 @@ func (st *statement) ColumnConverter(idx int) driver.ValueConverter {
 			c = Num
 		}
 	}
-	logger := getLogger(context.TODO())
-	if logger != nil {
+	ctx := context.Background()
+	logger := getLogger(ctx)
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("ColumnConverter", "c", c)
 	}
 	return driver.Null{Converter: c}
 }
 
-func (st *statement) openRows(colCount int) (*rows, error) {
+func (st *statement) openRows(ctx context.Context, colCount int) (*rows, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -3429,7 +3643,7 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 
 	var info C.dpiQueryInfo
 	var ti C.dpiDataTypeInfo
-	logger := getLogger(context.TODO())
+	logger := getLogger(ctx)
 	for i := 0; i < colCount; i++ {
 		if err := st.checkExecNoLOT(func() C.int {
 			return C.dpiStmt_getQueryInfo(st.dpiStmt, C.uint32_t(i+1), &info)
@@ -3438,7 +3652,7 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 		}
 		ti = info.typeInfo
 		bufSize := int(ti.clientSizeInBytes)
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("openRows", "col", i, "info", ti)
 		}
 		//if logger != nil {Log("dNTN", int(ti.defaultNativeTypeNum), "number", C.DPI_ORACLE_TYPE_NUMBER) }
@@ -3465,7 +3679,7 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 				ti.defaultNativeTypeNum = C.DPI_NATIVE_TYPE_BYTES
 			}
 		}
-		r.columns[i] = Column{
+		col := Column{
 			Name:           C.GoStringN(info.name, C.int(info.nameLength)),
 			OracleType:     effTypeNum,
 			OrigOracleType: ti.oracleTypeNum,
@@ -3478,6 +3692,9 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 			SizeInChars:    ti.sizeInChars,
 			DBSize:         ti.dbSizeInBytes,
 		}
+		col.DomainAnnotation.init(ti)
+		r.columns[i] = col
+
 		var err error
 		//fmt.Printf("%d. %+v\n", i, r.columns[i])
 		vi := varInfo{
@@ -3516,6 +3733,29 @@ type Column struct {
 	Precision                  C.int16_t
 	Scale                      C.int8_t
 	Nullable                   bool
+	DomainAnnotation
+}
+
+type DomainAnnotation struct {
+	DomainName  string
+	Annotations []Annotation
+}
+type Annotation struct{ Key, Value string }
+
+func (da *DomainAnnotation) init(ti C.dpiDataTypeInfo) {
+	if ti.domainNameLength != 0 {
+		da.DomainName = C.GoStringN(ti.domainName, C.int(ti.domainNameLength))
+	}
+	if ti.numAnnotations != 0 {
+		da.Annotations = make([]Annotation, int(ti.numAnnotations))
+		for j := range da.Annotations {
+			a := C.godror_getAnnotation(ti.annotations, C.int(j))
+			da.Annotations[j] = Annotation{
+				Key:   C.GoStringN(a.key, C.int(a.keyLength)),
+				Value: C.GoStringN(a.value, C.int(a.valueLength)),
+			}
+		}
+	}
 }
 
 func dpiSetFromString(dv *C.dpiVar, pos C.uint32_t, x string) {
@@ -3550,19 +3790,20 @@ func isInvalidErr(err error) bool {
 
 var maxStackSize uint32 = 2048
 
-func stmtSetFinalizer(st *statement, tag string) {
+func stmtSetFinalizer(ctx context.Context, st *statement, tag string) {
 	if !guardWithFinalizers.Load() {
 		return
 	}
+	logger := getLogger(ctx)
 	if !logLingeringResourceStack.Load() {
 		runtime.SetFinalizer(st, func(st *statement) {
 			if st != nil && st.dpiStmt != nil {
-				if logger := getLogger(context.TODO()); logger != nil {
+				if logger != nil {
 					logger.Error("statement is not closed", "stmt", st, "tag", tag)
 				} else {
 					fmt.Printf("ERROR: statement %p of %s is not closed!\n", st, tag)
 				}
-				_ = st.closeNotLocking()
+				_ = st.closeNotLocking(ctx)
 			}
 		})
 		return
@@ -3585,12 +3826,12 @@ func stmtSetFinalizer(st *statement, tag string) {
 
 	runtime.SetFinalizer(st, func(st *statement) {
 		if st != nil && st.dpiStmt != nil {
-			if logger := getLogger(context.TODO()); logger != nil {
+			if logger != nil {
 				logger.Error("statement is not closed", "stmt", st, "tag", tag, "stack", string(stack))
 			} else {
 				fmt.Printf("ERROR: statement %p of %s is not closed!\n%s\n", st, tag, stack)
 			}
-			_ = st.closeNotLocking()
+			_ = st.closeNotLocking(ctx)
 		}
 	})
 }

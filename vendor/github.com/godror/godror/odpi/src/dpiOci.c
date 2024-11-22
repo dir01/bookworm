@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2017, 2022, Oracle and/or its affiliates.
+// Copyright (c) 2017, 2024, Oracle and/or its affiliates.
 //
 // This software is dual-licensed to you under the Universal Permissive License
 // (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl and Apache License
@@ -79,6 +79,13 @@ static void *dpiOci__reallocMem(void *unused, void *ptr, size_t newSize);
     if (status != DPI_OCI_SUCCESS) \
         return dpiError__setFromOCI(error, status, conn, action); \
     return DPI_SUCCESS;
+
+// macro to get the default mode to use when binding
+#define DPI_OCI_DEFAULT_BIND_MODE(stmt) \
+    (stmt->env->versionInfo->versionNum < 23 \
+        || (stmt->env->versionInfo->versionNum == 23 \
+        && stmt->env->versionInfo->releaseNum < 6)) ? DPI_OCI_DEFAULT : \
+    DPI_OCI_BIND_DEDICATED_REF_CURSOR
 
 
 // typedefs for all OCI functions used by ODPI-C
@@ -480,6 +487,10 @@ typedef int (*dpiOciFnType__typeByName)(void *env, void *err, const void *svc,
         const char *schema_name, uint32_t s_length, const char *type_name,
         uint32_t t_length, const char *version_name, uint32_t v_length,
         uint16_t pin_duration, int get_option, void **tdo);
+typedef int (*dpiOciFnType__vectorFromArray)(void *vectord, void *errhp,
+        uint8_t vformat, uint32_t vdim, void *vecarray, uint32_t mode);
+typedef int (*dpiOciFnType__vectorToArray)(void *vectord, void *errhp,
+        uint8_t vformat, uint32_t *vdim, void *vecarray, uint32_t mode);
 
 
 // library handle for dynamically loaded OCI library
@@ -672,6 +683,8 @@ static struct {
     dpiOciFnType__transStart fnTransStart;
     dpiOciFnType__typeByFullName fnTypeByFullName;
     dpiOciFnType__typeByName fnTypeByName;
+    dpiOciFnType__vectorFromArray fnVectorFromArray;
+    dpiOciFnType__vectorToArray fnVectorToArray;
 } dpiOciSymbols;
 
 
@@ -851,8 +864,11 @@ int dpiOci__attrSet(void *handle, uint32_t handleType, void *ptr,
 int dpiOci__bindByName(dpiStmt *stmt, void **bindHandle, const char *name,
         int32_t nameLength, int dynamicBind, dpiVar *var, dpiError *error)
 {
+    uint32_t mode = DPI_OCI_DEFAULT;
     int status;
 
+    if (dynamicBind)
+        mode |= DPI_OCI_DATA_AT_EXEC;
     DPI_OCI_LOAD_SYMBOL("OCIBindByName", dpiOciSymbols.fnBindByName)
     DPI_OCI_ENSURE_ERROR_HANDLE(error)
     status = (*dpiOciSymbols.fnBindByName)(stmt->handle, bindHandle,
@@ -865,8 +881,7 @@ int dpiOci__bindByName(dpiStmt *stmt, void **bindHandle, const char *name,
                     var->buffer.actualLength16,
             (dynamicBind) ? NULL : var->buffer.returnCode,
             (var->isArray) ? var->buffer.maxArraySize : 0,
-            (var->isArray) ? &var->buffer.actualArraySize : NULL,
-            (dynamicBind) ? DPI_OCI_DATA_AT_EXEC : DPI_OCI_DEFAULT);
+            (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
     DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by name");
 }
 
@@ -878,8 +893,11 @@ int dpiOci__bindByName(dpiStmt *stmt, void **bindHandle, const char *name,
 int dpiOci__bindByName2(dpiStmt *stmt, void **bindHandle, const char *name,
         int32_t nameLength, int dynamicBind, dpiVar *var, dpiError *error)
 {
+    uint32_t mode = DPI_OCI_DEFAULT_BIND_MODE(stmt);
     int status;
 
+    if (dynamicBind)
+        mode |= DPI_OCI_DATA_AT_EXEC;
     DPI_OCI_LOAD_SYMBOL("OCIBindByName2", dpiOciSymbols.fnBindByName2)
     DPI_OCI_ENSURE_ERROR_HANDLE(error)
     status = (*dpiOciSymbols.fnBindByName2)(stmt->handle, bindHandle,
@@ -892,8 +910,7 @@ int dpiOci__bindByName2(dpiStmt *stmt, void **bindHandle, const char *name,
                     var->buffer.actualLength32,
             (dynamicBind) ? NULL : var->buffer.returnCode,
             (var->isArray) ? var->buffer.maxArraySize : 0,
-            (var->isArray) ? &var->buffer.actualArraySize : NULL,
-            (dynamicBind) ? DPI_OCI_DATA_AT_EXEC : DPI_OCI_DEFAULT);
+            (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
     DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by name");
 }
 
@@ -905,8 +922,11 @@ int dpiOci__bindByName2(dpiStmt *stmt, void **bindHandle, const char *name,
 int dpiOci__bindByPos(dpiStmt *stmt, void **bindHandle, uint32_t pos,
         int dynamicBind, dpiVar *var, dpiError *error)
 {
+    uint32_t mode = DPI_OCI_DEFAULT;
     int status;
 
+    if (dynamicBind)
+        mode |= DPI_OCI_DATA_AT_EXEC;
     DPI_OCI_LOAD_SYMBOL("OCIBindByPos", dpiOciSymbols.fnBindByPos)
     DPI_OCI_ENSURE_ERROR_HANDLE(error)
     status = (*dpiOciSymbols.fnBindByPos)(stmt->handle, bindHandle,
@@ -918,8 +938,7 @@ int dpiOci__bindByPos(dpiStmt *stmt, void **bindHandle, uint32_t pos,
                     var->buffer.actualLength16,
             (dynamicBind) ? NULL : var->buffer.returnCode,
             (var->isArray) ? var->buffer.maxArraySize : 0,
-            (var->isArray) ? &var->buffer.actualArraySize : NULL,
-            (dynamicBind) ? DPI_OCI_DATA_AT_EXEC : DPI_OCI_DEFAULT);
+            (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
     DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by position");
 }
 
@@ -931,8 +950,11 @@ int dpiOci__bindByPos(dpiStmt *stmt, void **bindHandle, uint32_t pos,
 int dpiOci__bindByPos2(dpiStmt *stmt, void **bindHandle, uint32_t pos,
         int dynamicBind, dpiVar *var, dpiError *error)
 {
+    uint32_t mode = DPI_OCI_DEFAULT_BIND_MODE(stmt);
     int status;
 
+    if (dynamicBind)
+        mode |= DPI_OCI_DATA_AT_EXEC;
     DPI_OCI_LOAD_SYMBOL("OCIBindByPos2", dpiOciSymbols.fnBindByPos2)
     DPI_OCI_ENSURE_ERROR_HANDLE(error)
     status = (*dpiOciSymbols.fnBindByPos2)(stmt->handle, bindHandle,
@@ -944,8 +966,7 @@ int dpiOci__bindByPos2(dpiStmt *stmt, void **bindHandle, uint32_t pos,
                     var->buffer.actualLength32,
             (dynamicBind) ? NULL : var->buffer.returnCode,
             (var->isArray) ? var->buffer.maxArraySize : 0,
-            (var->isArray) ? &var->buffer.actualArraySize : NULL,
-            (dynamicBind) ? DPI_OCI_DATA_AT_EXEC : DPI_OCI_DEFAULT);
+            (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
     DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by position");
 }
 
@@ -4328,4 +4349,39 @@ int dpiOci__typeByFullName(dpiConn *conn, const char *name,
             error->handle, conn->handle, name, nameLength, NULL, 0,
             DPI_OCI_DURATION_SESSION, DPI_OCI_TYPEGET_ALL, tdo);
     DPI_OCI_CHECK_AND_RETURN(error, status, conn, "get type by full name");
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiOci__vectorFromArray() [INTERNAL]
+//   Wrapper for OCIVectorFromArray().
+//-----------------------------------------------------------------------------
+int dpiOci__vectorFromArray(dpiVector *vector, dpiVectorInfo *info,
+        dpiError *error)
+{
+    int status;
+
+    DPI_OCI_LOAD_SYMBOL("OCIVectorFromArray", dpiOciSymbols.fnVectorFromArray)
+    DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    status = (*dpiOciSymbols.fnVectorFromArray)(vector->handle, error->handle,
+            info->format, info->numDimensions, info->dimensions.asPtr,
+            DPI_OCI_DEFAULT);
+    DPI_OCI_CHECK_AND_RETURN(error, status, vector->conn, "vector from array");
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiOci__vectorToArray() [INTERNAL]
+//   Wrapper for OCIVectorToArray().
+//-----------------------------------------------------------------------------
+int dpiOci__vectorToArray(dpiVector *vector, dpiError *error)
+{
+    int status;
+
+    DPI_OCI_LOAD_SYMBOL("OCIVectorToArray", dpiOciSymbols.fnVectorToArray)
+    DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    status = (*dpiOciSymbols.fnVectorToArray)(vector->handle, error->handle,
+            vector->format, &vector->numDimensions, vector->dimensions,
+            DPI_OCI_DEFAULT);
+    DPI_OCI_CHECK_AND_RETURN(error, status, vector->conn, "vector to array");
 }

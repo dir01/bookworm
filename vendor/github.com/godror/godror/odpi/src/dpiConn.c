@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2023, Oracle and/or its affiliates.
+// Copyright (c) 2016, 2024, Oracle and/or its affiliates.
 //
 // This software is dual-licensed to you under the Universal Permissive License
 // (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl and Apache License
@@ -50,7 +50,7 @@ static int dpiConn__getSession(dpiConn *conn, uint32_t mode,
 static int dpiConn__setAttributesFromCreateParams(dpiConn *conn, void *handle,
         uint32_t handleType, const char *userName, uint32_t userNameLength,
         const char *password, uint32_t passwordLength,
-        const dpiConnCreateParams *params, dpiError *error);
+        const dpiConnCreateParams *params, int *used, dpiError *error);
 static int dpiConn__setShardingKey(dpiConn *conn, void **shardingKey,
         void *handle, uint32_t handleType, uint32_t attribute,
         const char *action, dpiShardingKeyColumn *columns, uint8_t numColumns,
@@ -453,6 +453,7 @@ static int dpiConn__createStandalone(dpiConn *conn, const char *userName,
         const dpiConnCreateParams *createParams, dpiError *error)
 {
     uint32_t credentialType, authMode;
+    int used = 0;
 
     // mark the connection as a standalone connection
     conn->standalone = 1;
@@ -498,7 +499,7 @@ static int dpiConn__createStandalone(dpiConn *conn, const char *userName,
     // populate attributes on the session handle
     if (dpiConn__setAttributesFromCreateParams(conn, conn->sessionHandle,
             DPI_OCI_HTYPE_SESSION, userName, userNameLength, password,
-            passwordLength, createParams, error) < 0)
+            passwordLength, createParams, &used, error) < 0)
         return DPI_FAILURE;
 
     // set the session handle on the service context handle
@@ -585,6 +586,10 @@ void dpiConn__free(dpiConn *conn, dpiError *error)
         dpiHandleList__free(conn->objects);
         conn->objects = NULL;
     }
+    if (conn->info) {
+        dpiUtils__freeMemory(conn->info);
+        conn->info = NULL;
+    }
     dpiUtils__freeMemory(conn);
 }
 
@@ -603,6 +608,7 @@ static int dpiConn__get(dpiConn *conn, const char *userName,
     int externalAuth, status;
     void *authInfo;
     uint32_t mode;
+    int used = 0;
 
     // clear pointers if length is 0
     if (userNameLength == 0)
@@ -647,14 +653,15 @@ static int dpiConn__get(dpiConn *conn, const char *userName,
     // set attributes for create parameters
     if (dpiConn__setAttributesFromCreateParams(conn, authInfo,
             DPI_OCI_HTYPE_AUTHINFO, userName, userNameLength, password,
-            passwordLength, createParams, error) < 0) {
+            passwordLength, createParams, &used, error) < 0) {
         dpiOci__handleFree(authInfo, DPI_OCI_HTYPE_AUTHINFO);
         return DPI_FAILURE;
     }
 
     // get a session from the pool
     status = dpiConn__getSession(conn, mode, connectString,
-            connectStringLength, createParams, authInfo, error);
+            connectStringLength, createParams, (used) ? authInfo : NULL,
+            error);
     dpiOci__handleFree(authInfo, DPI_OCI_HTYPE_AUTHINFO);
     if (status < 0)
         return status;
@@ -690,6 +697,9 @@ static int dpiConn__getAttributeText(dpiConn *conn, uint32_t attribute,
         case DPI_OCI_ATTR_INSTNAME:
         case DPI_OCI_ATTR_INTERNAL_NAME:
         case DPI_OCI_ATTR_EXTERNAL_NAME:
+        case DPI_OCI_ATTR_DBNAME:
+        case DPI_OCI_ATTR_DBDOMAIN:
+        case DPI_OCI_ATTR_SERVICENAME:
             status = dpiOci__attrGet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
                     (void*) value, valueLength, attribute, "get server value",
                     &error);
@@ -718,6 +728,78 @@ static int dpiConn__getHandles(dpiConn *conn, dpiError *error)
             (void*) &conn->serverHandle, NULL, DPI_OCI_ATTR_SERVER,
             "get server handle", error) < 0)
         return DPI_FAILURE;
+
+    return DPI_SUCCESS;
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiConn__getInfo() [INTERNAL]
+//   Return information about the connection in the provided structure.
+//-----------------------------------------------------------------------------
+static int dpiConn__getInfo(dpiConn *conn, dpiError *error)
+{
+    uint8_t temp8;
+
+    // if the cache has been populated and we are not using DRCP, no need to do
+    // anything further
+    if (conn->info && conn->info->serverType != DPI_SERVER_TYPE_UNKNOWN &&
+            conn->info->serverType != DPI_SERVER_TYPE_POOLED)
+        return DPI_SUCCESS;
+
+    // allocate memory for the cached information, if needed
+    if (!conn->info) {
+        if (dpiUtils__allocateMemory(1, sizeof(dpiConnInfo), 1,
+                "allocate connection info", (void**) &conn->info, error) < 0)
+            return DPI_FAILURE;
+    }
+
+    // determine database domain
+    if (dpiOci__attrGet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
+            (void*) &conn->info->dbDomain, &conn->info->dbDomainLength,
+            DPI_OCI_ATTR_DBDOMAIN, "get database domain", error) < 0)
+        return DPI_FAILURE;
+
+    // determine database name
+    if (dpiOci__attrGet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
+            (void*) &conn->info->dbName, &conn->info->dbNameLength,
+            DPI_OCI_ATTR_DBNAME, "get database name", error) < 0)
+        return DPI_FAILURE;
+
+    // determine instance name
+    if (dpiOci__attrGet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
+            (void*) &conn->info->instanceName, &conn->info->instanceNameLength,
+            DPI_OCI_ATTR_INSTNAME, "get instance name", error) < 0)
+        return DPI_FAILURE;
+
+    // determine service name
+    if (dpiOci__attrGet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
+            (void*) &conn->info->serviceName, &conn->info->serviceNameLength,
+            DPI_OCI_ATTR_SERVICENAME, "get service name", error) < 0)
+        return DPI_FAILURE;
+
+    // determine max identifier length
+    if (dpiOci__attrGet(conn->handle, DPI_OCI_HTYPE_SVCCTX,
+            &conn->info->maxIdentifierLength, NULL,
+            DPI_OCI_ATTR_MAX_IDENTIFIER_LEN, "get max identifier length",
+            error) < 0)
+        return DPI_FAILURE;
+
+    // determine max open cursors
+    if (dpiOci__attrGet(conn->sessionHandle, DPI_OCI_HTYPE_SESSION,
+            &conn->info->maxOpenCursors, NULL, DPI_OCI_ATTR_MAX_OPEN_CURSORS,
+            "get max open cursors", error) < 0)
+        return DPI_FAILURE;
+
+    // determine the server type, if possible; it is determined last in order
+    // to ensure that only completely cached information is returned
+    if (dpiUtils__checkClientVersion(conn->env->versionInfo, 23, 4,
+            NULL) == DPI_SUCCESS) {
+        if (dpiOci__attrGet(conn->handle, DPI_OCI_HTYPE_SVCCTX, &temp8,
+                NULL, DPI_OCI_ATTR_SERVER_TYPE, "get server type", error) < 0)
+            return DPI_FAILURE;
+        conn->info->serverType = temp8;
+    }
 
     return DPI_SUCCESS;
 }
@@ -986,6 +1068,30 @@ static int dpiConn__getSession(dpiConn *conn, uint32_t mode,
 
 
 //-----------------------------------------------------------------------------
+// dpiConn__newVector() [INTERNAL]
+//   Internal method for creating a vector. If vector information is supplied
+// the vector is populated with this information.
+//-----------------------------------------------------------------------------
+int dpiConn__newVector(dpiConn *conn, dpiVectorInfo *info, dpiVector **vector,
+        dpiError *error)
+{
+    dpiVector *tempVector;
+
+    if (dpiVector__allocate(conn, &tempVector, error) < 0)
+        return DPI_FAILURE;
+    if (info) {
+        if (dpiOci__vectorFromArray(tempVector, info, error) < 0) {
+            dpiVector__free(tempVector, error);
+            return DPI_FAILURE;
+        }
+    }
+
+    *vector = tempVector;
+    return DPI_SUCCESS;
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiConn__rollback() [PUBLIC]
 //   Internal method for rolling back the transaction associated with the
 // connection. Once the rollback has taken place, the transaction handle
@@ -1064,33 +1170,41 @@ static int dpiConn__setAppContext(void *handle, uint32_t handleType,
 static int dpiConn__setAttributesFromCreateParams(dpiConn *conn, void *handle,
         uint32_t handleType, const char *userName, uint32_t userNameLength,
         const char *password, uint32_t passwordLength,
-        const dpiConnCreateParams *params, dpiError *error)
+        const dpiConnCreateParams *params, int *used, dpiError *error)
 {
     uint32_t purity;
 
     // set credentials
-    if (userName && userNameLength > 0 && dpiOci__attrSet(handle,
-            handleType, (void*) userName, userNameLength,
-            DPI_OCI_ATTR_USERNAME, "set user name", error) < 0)
-        return DPI_FAILURE;
-    if (password && passwordLength > 0 && dpiOci__attrSet(handle,
-            handleType, (void*) password, passwordLength,
-            DPI_OCI_ATTR_PASSWORD, "set password", error) < 0)
-        return DPI_FAILURE;
+    if (userName && userNameLength > 0) {
+        if (dpiOci__attrSet(handle, handleType, (void*) userName,
+                userNameLength, DPI_OCI_ATTR_USERNAME, "set user name",
+                error) < 0)
+            return DPI_FAILURE;
+        *used = 1;
+    }
+    if (password && passwordLength > 0) {
+        if (dpiOci__attrSet(handle, handleType, (void*) password,
+                passwordLength, DPI_OCI_ATTR_PASSWORD, "set password",
+                error) < 0)
+            return DPI_FAILURE;
+        *used = 1;
+    }
 
     // set connection class and purity parameters
-    if (params->connectionClass && params->connectionClassLength > 0 &&
-            dpiOci__attrSet(handle, handleType,
-                    (void*) params->connectionClass,
-                    params->connectionClassLength,
-                    DPI_OCI_ATTR_CONNECTION_CLASS, "set connection class",
-                    error) < 0)
-        return DPI_FAILURE;
+    if (params->connectionClass && params->connectionClassLength > 0) {
+        if (dpiOci__attrSet(handle, handleType,
+                (void*) params->connectionClass, params->connectionClassLength,
+                DPI_OCI_ATTR_CONNECTION_CLASS, "set connection class",
+                error) < 0)
+            return DPI_FAILURE;
+        *used = 1;
+    }
     if (params->purity != DPI_OCI_ATTR_PURITY_DEFAULT) {
         purity = params->purity;
-        if (dpiOci__attrSet(handle, handleType, &purity,
-                sizeof(purity), DPI_OCI_ATTR_PURITY, "set purity", error) < 0)
+        if (dpiOci__attrSet(handle, handleType, &purity, sizeof(purity),
+                DPI_OCI_ATTR_PURITY, "set purity", error) < 0)
             return DPI_FAILURE;
+        *used = 1;
     }
 
     // set sharding key and super sharding key parameters
@@ -1100,6 +1214,7 @@ static int dpiConn__setAttributesFromCreateParams(dpiConn *conn, void *handle,
                 params->shardingKeyColumns, params->numShardingKeyColumns,
                 error) < 0)
             return DPI_FAILURE;
+        *used = 1;
     }
     if (params->superShardingKeyColumns &&
             params->numSuperShardingKeyColumns > 0) {
@@ -1111,6 +1226,7 @@ static int dpiConn__setAttributesFromCreateParams(dpiConn *conn, void *handle,
                 "set super sharding key", params->superShardingKeyColumns,
                 params->numSuperShardingKeyColumns, error) < 0)
             return DPI_FAILURE;
+        *used = 1;
     }
 
     // set application context, if applicable
@@ -1807,6 +1923,29 @@ int dpiConn_getCurrentSchema(dpiConn *conn, const char **value,
 
 
 //-----------------------------------------------------------------------------
+// dpiConn_getDbDomain() [PUBLIC]
+//   Returns the name of the database domain.
+//-----------------------------------------------------------------------------
+int dpiConn_getDbDomain(dpiConn *conn, const char **value,
+        uint32_t *valueLength)
+{
+  return dpiConn__getAttributeText(conn, DPI_OCI_ATTR_DBDOMAIN, value,
+          valueLength, __func__);
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiConn_getDbName() [PUBLIC]
+//   Returns the name of the database.
+//-----------------------------------------------------------------------------
+int dpiConn_getDbName(dpiConn *conn, const char **value, uint32_t *valueLength)
+{
+    return dpiConn__getAttributeText(conn, DPI_OCI_ATTR_DBNAME, value,
+            valueLength, __func__);
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiConn_getEdition() [PUBLIC]
 //   Return the edition associated with the connection.
 //-----------------------------------------------------------------------------
@@ -1861,6 +2000,25 @@ int dpiConn_getHandle(dpiConn *conn, void **handle)
     DPI_CHECK_PTR_NOT_NULL(conn, handle)
     *handle = conn->handle;
     return dpiGen__endPublicFn(conn, DPI_SUCCESS, &error);
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiConn_getInfo() [PUBLIC]
+//   Return information about the connection in the provided structure.
+//-----------------------------------------------------------------------------
+int dpiConn_getInfo(dpiConn *conn, dpiConnInfo *info)
+{
+    dpiError error;
+    int status;
+
+    if (dpiConn__check(conn, __func__, &error) < 0)
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    DPI_CHECK_PTR_NOT_NULL(conn, info)
+    status = dpiConn__getInfo(conn, &error);
+    if (status == DPI_SUCCESS)
+        memcpy(info, conn->info, sizeof(dpiConnInfo));
+    return dpiGen__endPublicFn(conn, status, &error);
 }
 
 
@@ -1923,6 +2081,28 @@ int dpiConn_getLTXID(dpiConn *conn, const char **value, uint32_t *valueLength)
 {
     return dpiConn__getAttributeText(conn, DPI_OCI_ATTR_LTXID, value,
             valueLength, __func__);
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiConn_getMaxOpenCursors() [PUBLIC]
+//   Returns the maximum number of cursors that can be opened by the database.
+// This is the value of the "open_cursors" parameter in init.ora.
+//-----------------------------------------------------------------------------
+int dpiConn_getMaxOpenCursors(dpiConn *conn, uint32_t *maxOpenCursors)
+{
+    dpiError error;
+    int status;
+
+    // validate parameters
+    if (dpiConn__check(conn, __func__, &error) < 0)
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    DPI_CHECK_PTR_NOT_NULL(conn, maxOpenCursors)
+
+    status = dpiOci__attrGet(conn->sessionHandle, DPI_OCI_HTYPE_SESSION,
+            maxOpenCursors, NULL, DPI_OCI_ATTR_MAX_OPEN_CURSORS,
+            "get max open cursors", &error);
+    return dpiGen__endPublicFn(conn, status, &error);
 }
 
 
@@ -2061,6 +2241,18 @@ int dpiConn_getServerVersion(dpiConn *conn, const char **releaseString,
 
 
 //-----------------------------------------------------------------------------
+// dpiConn_getServiceName() [PUBLIC]
+//   Returns the name of the service used to connect to the database.
+//-----------------------------------------------------------------------------
+int dpiConn_getServiceName(dpiConn *conn, const char **value,
+        uint32_t *valueLength)
+{
+    return dpiConn__getAttributeText(conn, DPI_OCI_ATTR_SERVICENAME, value,
+            valueLength, __func__);
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiConn_getStmtCacheSize() [PUBLIC]
 //   Return the current size of the statement cache.
 //-----------------------------------------------------------------------------
@@ -2140,7 +2332,7 @@ int dpiConn_newJson(dpiConn *conn, dpiJson **json)
     if (dpiConn__check(conn, __func__, &error) < 0)
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(conn, json);
-    status = dpiJson__allocate(conn, json, &error);
+    status = dpiJson__allocate(conn, NULL, json, &error);
     return dpiGen__endPublicFn(conn, status, &error);
 }
 
@@ -2256,6 +2448,23 @@ int dpiConn_newVar(dpiConn *conn, dpiOracleTypeNum oracleTypeNum,
     DPI_CHECK_PTR_NOT_NULL(conn, data)
     status = dpiVar__allocate(conn, oracleTypeNum, nativeTypeNum, maxArraySize,
             size, sizeIsBytes, isArray, objType, var, data, &error);
+    return dpiGen__endPublicFn(conn, status, &error);
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiConn_newVector() [PUBLIC]
+//   Create a new variable and return it.
+//-----------------------------------------------------------------------------
+int dpiConn_newVector(dpiConn *conn, dpiVectorInfo *info, dpiVector **vector)
+{
+    dpiError error;
+    int status;
+
+    if (dpiConn__check(conn, __func__, &error) < 0)
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    DPI_CHECK_PTR_NOT_NULL(conn, vector)
+    status = dpiConn__newVector(conn, info, vector, &error);
     return dpiGen__endPublicFn(conn, status, &error);
 }
 
@@ -2512,6 +2721,30 @@ int dpiConn_setStmtCacheSize(dpiConn *conn, uint32_t cacheSize)
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     status = dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX, &cacheSize, 0,
             DPI_OCI_ATTR_STMTCACHESIZE, "set stmt cache size", &error);
+    return dpiGen__endPublicFn(conn, status, &error);
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiConn_getTransactionInProgress() [PUBLIC]
+//   Returns whether or not a transaction is in progress. This can be used to
+// determine if a COMMIT is required or not.
+//----------------------------------------------------------------------------_
+int dpiConn_getTransactionInProgress(dpiConn *conn, int *value)
+{
+    dpiError error;
+    uint32_t temp;
+    int status;
+
+    // validate parameters
+    if (dpiConn__check(conn, __func__, &error) < 0)
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    DPI_CHECK_PTR_NOT_NULL(conn, value);
+
+    status = dpiOci__attrGet(conn->sessionHandle, DPI_OCI_HTYPE_SESSION,
+            &temp, NULL, DPI_OCI_ATTR_TRANSACTION_IN_PROGRESS,
+            "get Transaction in progress", &error);
+    *value = (temp == 0) ? 0: 1;
     return dpiGen__endPublicFn(conn, status, &error);
 }
 

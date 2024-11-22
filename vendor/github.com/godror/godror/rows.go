@@ -122,7 +122,8 @@ func (r *rows) ColumnTypeLength(index int) (length int64, ok bool) {
 		C.DPI_ORACLE_TYPE_BLOB,
 		C.DPI_ORACLE_TYPE_BFILE,
 		C.DPI_NATIVE_TYPE_LOB,
-		C.DPI_ORACLE_TYPE_JSON, C.DPI_ORACLE_TYPE_JSON_OBJECT, C.DPI_ORACLE_TYPE_JSON_ARRAY:
+		C.DPI_ORACLE_TYPE_JSON, C.DPI_ORACLE_TYPE_JSON_OBJECT, C.DPI_ORACLE_TYPE_JSON_ARRAY,
+		C.DPI_ORACLE_TYPE_XMLTYPE:
 		return math.MaxInt64, true
 	default:
 		return 0, false
@@ -188,6 +189,8 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 		return "OBJECT"
 	case C.DPI_ORACLE_TYPE_JSON, C.DPI_ORACLE_TYPE_JSON_OBJECT, C.DPI_ORACLE_TYPE_JSON_ARRAY:
 		return "JSON"
+	case C.DPI_ORACLE_TYPE_XMLTYPE:
+		return "XMLTYPE"
 	default:
 		return fmt.Sprintf("OTHER[%d]", r.columns[index].OracleType)
 	}
@@ -290,7 +293,8 @@ func (r *rows) Next(dest []driver.Value) error {
 	if len(dest) != len(r.columns) {
 		return fmt.Errorf("column count mismatch: we have %d columns, but given %d destination", len(r.columns), len(dest))
 	}
-	logger := getLogger(context.TODO())
+	ctx := context.Background()
+	logger := getLogger(ctx)
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -340,7 +344,7 @@ func (r *rows) Next(dest []driver.Value) error {
 			}
 			return r.err
 		}
-		if logger != nil {
+		if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 			logger.Debug("fetched", "bri", r.bufferRowIndex, "fetched", r.fetched, "moreRows", moreRows, "len(data)", len(r.data), "cols", len(r.columns))
 		}
 		if r.fetched == 0 {
@@ -381,7 +385,8 @@ func (r *rows) Next(dest []driver.Value) error {
 		switch typ {
 		case C.DPI_ORACLE_TYPE_VARCHAR, C.DPI_ORACLE_TYPE_NVARCHAR,
 			C.DPI_ORACLE_TYPE_CHAR, C.DPI_ORACLE_TYPE_NCHAR,
-			C.DPI_ORACLE_TYPE_LONG_VARCHAR, C.DPI_ORACLE_TYPE_LONG_NVARCHAR:
+			C.DPI_ORACLE_TYPE_LONG_VARCHAR, C.DPI_ORACLE_TYPE_LONG_NVARCHAR,
+			C.DPI_ORACLE_TYPE_XMLTYPE:
 			//fmt.Printf("CHAR\n")
 			if isNull {
 				dest[i] = ""
@@ -535,8 +540,11 @@ func (r *rows) Next(dest []driver.Value) error {
 					nil, // just obey to what's included in the data
 				)
 			}
-			if tz == nil && logger != nil {
-				logger.Warn("DATE", "i", i, "tz", tz, "params", r.conn.params)
+			if tz == nil {
+				if logger != nil {
+					logger.Warn("DATE", "i", i, "tz", tz, "params", r.conn.params)
+				}
+				tz = time.Local
 			}
 			dest[i] = time.Date(
 				int(ts.year), time.Month(ts.month), int(ts.day),
@@ -552,7 +560,7 @@ func (r *rows) Next(dest []driver.Value) error {
 				continue
 			}
 			var t time.Duration
-			dataGetIntervalDS(&t, d)
+			dataGetIntervalDS(ctx, &t, d)
 			dest[i] = t
 		case C.DPI_ORACLE_TYPE_INTERVAL_YM, C.DPI_NATIVE_TYPE_INTERVAL_YM:
 			if isNull {
@@ -610,7 +618,7 @@ func (r *rows) Next(dest []driver.Value) error {
 				return fmt.Errorf("getNumQueryColumns: %w", err)
 			}
 			st.Lock()
-			r2, err := st.openRows(int(colCount))
+			r2, err := st.openRows(ctx, int(colCount))
 			st.Unlock()
 			if err != nil {
 				if logger != nil {
@@ -620,7 +628,7 @@ func (r *rows) Next(dest []driver.Value) error {
 				return err
 			}
 			r2.fromData = true
-			stmtSetFinalizer(st, "Next")
+			stmtSetFinalizer(ctx, st, "Next")
 			dest[i] = r2
 
 		case C.DPI_ORACLE_TYPE_BOOLEAN, C.DPI_NATIVE_TYPE_BOOLEAN:
@@ -679,7 +687,7 @@ func (r *rows) Next(dest []driver.Value) error {
 	if debugRowsNext && r.fetched < 2 {
 		fmt.Printf("bri=%d fetched=%d\n", r.bufferRowIndex, r.fetched)
 	}
-	if logger != nil {
+	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		logger.Debug("scanned", "row", r.bufferRowIndex, "dest", dest)
 	}
 
@@ -766,6 +774,7 @@ func (r *rows) HasNextResultSet() bool {
 	return r.nextRs != nil
 }
 func (r *rows) NextResultSet() error {
+	ctx := context.Background()
 	if !r.HasNextResultSet() {
 		if r.nextRsErr != nil {
 			return r.nextRsErr
@@ -786,7 +795,7 @@ func (r *rows) NextResultSet() error {
 	}
 	// keep the originam statement for the succeeding NextResultSet calls.
 	st.Lock()
-	nr, err := st.openRows(int(n))
+	nr, err := st.openRows(ctx, int(n))
 	st.Unlock()
 	if err != nil {
 		if logger != nil {
@@ -795,7 +804,7 @@ func (r *rows) NextResultSet() error {
 		st.Close()
 		return err
 	}
-	stmtSetFinalizer(st, "NextResultSet")
+	stmtSetFinalizer(ctx, st, "NextResultSet")
 	nr.origSt = r.origSt
 	if nr.origSt == nil {
 		nr.origSt = r.statement

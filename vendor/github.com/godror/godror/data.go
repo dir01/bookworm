@@ -33,6 +33,27 @@ type Data struct {
 	NativeTypeNum C.dpiNativeTypeNum
 }
 
+const (
+	NativeTypeInt64      = C.DPI_NATIVE_TYPE_INT64
+	NativeTypeUint64     = C.DPI_NATIVE_TYPE_UINT64
+	NativeTypeFloat      = C.DPI_NATIVE_TYPE_FLOAT
+	NativeTypeDouble     = C.DPI_NATIVE_TYPE_DOUBLE
+	NativeTypeBytes      = C.DPI_NATIVE_TYPE_BYTES
+	NativeTypeTimestamp  = C.DPI_NATIVE_TYPE_TIMESTAMP
+	NativeTypeIntervalDS = C.DPI_NATIVE_TYPE_INTERVAL_DS
+	NativeTypeIntervalYM = C.DPI_NATIVE_TYPE_INTERVAL_YM
+	NativeTypeLOB        = C.DPI_NATIVE_TYPE_LOB
+	NativeTypeObject     = C.DPI_NATIVE_TYPE_OBJECT
+	NativeTypeStmt       = C.DPI_NATIVE_TYPE_STMT
+	NativeTypeBoolean    = C.DPI_NATIVE_TYPE_BOOLEAN
+	NativeTypeRowid      = C.DPI_NATIVE_TYPE_ROWID
+	NativeTypeJSON       = C.DPI_NATIVE_TYPE_JSON
+	NativeTypeJSONOBject = C.DPI_NATIVE_TYPE_JSON_OBJECT
+	NativeTypeJSONArray  = C.DPI_NATIVE_TYPE_JSON_ARRAY
+	// NativeTypeNULL       = C.DPI_NATIVE_TYPE_NULL
+	// NativeTypeVector     = C.DPI_NATIVE_TYPE_VECTOR
+)
+
 var ErrNotSupported = errors.New("not supported")
 
 // NewData creates a new Data structure for the given type, populated with the given type.
@@ -292,11 +313,11 @@ func (d *Data) SetTime(t time.Time) {
 		return
 	}
 	d.NativeTypeNum = C.DPI_NATIVE_TYPE_TIMESTAMP
-	dataSetTime(&d.dpiData, t, nil)
+	dataSetTime(context.Background(), &d.dpiData, t, nil)
 }
 
-func dataSetTime(dpiData *C.dpiData, t time.Time, connTZ *time.Location) {
-	logger := getLogger(context.TODO())
+func dataSetTime(ctx context.Context, dpiData *C.dpiData, t time.Time, connTZ *time.Location) {
+	logger := getLogger(ctx)
 	tz, tzOff := connTZ, 0
 	if tz == nil {
 		tz = t.Location()
@@ -364,9 +385,9 @@ type IntervalYM struct {
 
 // Get returns the contents of Data.
 func (d *Data) Get() interface{} {
-	if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
-		logger.Debug("Get", "data", fmt.Sprintf("%#v", d), "p", fmt.Sprintf("%p", d))
-	}
+	// if logger := getLogger(context.TODO()); logger != nil && logger.Enabled(context.TODO(), slog.LevelDebug) {
+	// 	 logger.Debug("Get", "data", fmt.Sprintf("%#v", d), "p", fmt.Sprintf("%p", d))
+	// }
 	switch d.NativeTypeNum {
 	case 0:
 		return nil
@@ -634,6 +655,16 @@ func (d *Data) GetJSONObject() JSONObject {
 }
 func (d *Data) GetJSONArray() JSONArray {
 	return JSONArray{dpiJsonArray: ((*C.dpiJsonArray)(unsafe.Pointer(&d.dpiData.value)))}
+}
+
+// Prepare buffer for NUMBER OracleTypeNum.
+func (d *Data) prepare(oracleTypeNum C.uint) {
+	// If the native type is DPI_NATIVE_TYPE_BYTES and the Oracle type of the attribute is DPI_ORACLE_TYPE_NUMBER, a buffer must be supplied in the value.asBytes.ptr attribute and the maximum length of that buffer must be supplied in the value.asBytes.length attribute before calling this function. For all other conversions, the buffer is supplied by the library and remains valid as long as a reference to the object is held.
+	if d.NativeTypeNum == C.DPI_NATIVE_TYPE_BYTES &&
+		oracleTypeNum == C.DPI_ORACLE_TYPE_NUMBER {
+		var a [39]byte
+		C.dpiData_setBytes(&d.dpiData, (*C.char)(unsafe.Pointer(&a[0])), C.uint32_t(len(a)))
+	}
 }
 
 // For tests
