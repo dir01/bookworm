@@ -1,4 +1,4 @@
-FROM golang:1.21
+FROM golang:1.23
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
