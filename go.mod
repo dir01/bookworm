@@ -8,6 +8,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/rubenv/sql-migrate v1.7.1
 	github.com/tamerh/xml-stream-parser v1.5.0
+	github.com/tim-st/go-zim v0.1.3
 	gopkg.in/telebot.v3 v3.3.8
 )
 
@@ -33,6 +34,7 @@ require (
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
+	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/lib/pq v1.10.9 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -48,6 +50,7 @@ require (
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
 	github.com/tamerh/xpath v1.0.0 // indirect
+	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
 	golang.org/x/sys v0.28.0 // indirect

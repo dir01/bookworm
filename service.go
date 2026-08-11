@@ -23,6 +23,19 @@ type FileType string
 const FB2 FileType = "fb2"
 const ZIP FileType = "zip"
 const EPUB FileType = "epub"
+const ZIM FileType = "zim"
+
+// supportedExtensions are the file suffixes the scanner will index.
+var supportedExtensions = []string{".fb2", ".zip", ".epub", ".zim"}
+
+func isSupportedFile(path string) bool {
+	for _, ext := range supportedExtensions {
+		if strings.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return false
+}
 
 type BookMetadata struct {
 	// Database ID
@@ -99,7 +112,7 @@ func (s *Service) Run(ctx context.Context) error {
 	return nil
 }
 
-// Scan recursively extracts metadata from all .zip and .fb2 files in the directory and stores them in the database.
+// Scan recursively extracts metadata from all supported files (.fb2, .zip, .epub, .zim) in the directory and stores them in the database.
 func (s *Service) Scan(ctx context.Context) error {
 	return filepath.Walk(s.dirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -125,85 +138,139 @@ func (s *Service) Search(ctx context.Context, searchTerm string) ([]*BookMetadat
 	}
 }
 
-// GetBook returns a file reader for a book with id in outFormat format
+// GetBook returns a file reader for a book with id in outFormat format.
+// If the stored source is already in outFormat it is streamed as-is, otherwise
+// it is converted (via ebook-convert).
 func (s *Service) GetBook(ctx context.Context, id int64, outFormat FileType) (
 	file io.Reader,
 	cleanup func(),
 	err error,
 ) {
+	noop := func() {}
+
 	if outFormat != EPUB && outFormat != FB2 {
-		return nil, nil, fmt.Errorf("unsupported output format %q", outFormat)
+		return nil, noop, fmt.Errorf("unsupported output format %q", outFormat)
 	}
 
 	bookMetadata, err := s.store.GetBook(ctx, id)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error getting book metadata: %w", err)
+		return nil, noop, fmt.Errorf("error getting book metadata: %w", err)
 	}
 
+	source, sourceFormat, closeSource, err := s.openSource(bookMetadata)
+	if err != nil {
+		return nil, closeSource, err
+	}
+
+	if outFormat == sourceFormat {
+		return source, closeSource, nil
+	}
+
+	converted, removeConverted, err := s.convertBook(source, sourceFormat, outFormat)
+	cleanup = func() {
+		removeConverted()
+		closeSource()
+	}
+	if err != nil {
+		return nil, cleanup, err
+	}
+	return converted, cleanup, nil
+}
+
+// openSource returns a reader for the raw book bytes together with the format
+// they are in. For books that live inside a container (a .zip or a .zim) the
+// entry is read fully into memory so the container handle can be closed
+// immediately; book files are small enough for this to be cheap.
+func (s *Service) openSource(md *BookMetadata) (reader io.Reader, format FileType, cleanup func(), err error) {
 	cleanup = func() {}
 
-	var sourceFile io.Reader
-	switch bookMetadata.FileType {
-	case FB2:
-		sourceFile, err = os.Open(bookMetadata.FilePath)
+	switch md.FileType {
+	case FB2, EPUB:
+		f, err := os.Open(md.FilePath)
 		if err != nil {
-			return nil, cleanup, fmt.Errorf("error opening file %q: %w", bookMetadata.FilePath, err)
+			return nil, "", cleanup, fmt.Errorf("error opening file %q: %w", md.FilePath, err)
 		}
+		return f, md.FileType, func() { f.Close() }, nil
 	case ZIP:
-		z, err := zip.OpenReader(bookMetadata.FilePath)
+		buf, name, err := readZipEntry(md.FilePath, md.SubFilepath)
 		if err != nil {
-			return nil, cleanup, fmt.Errorf("error opening zip path %q: %w", bookMetadata.FilePath, err)
+			return nil, "", cleanup, err
 		}
-		for _, f := range z.File {
-			if f.Name == bookMetadata.SubFilepath {
-				sourceFile, err = f.Open()
-				if err != nil {
-					return nil, cleanup, fmt.Errorf("error opening file %q in zip archive %q: %w", f.Name, bookMetadata.FilePath, err)
-				}
-				goto convert // we might need to format the file, so we can't return here
-			}
+		return bytes.NewReader(buf), formatFromExt(name), cleanup, nil
+	case ZIM:
+		buf, err := openZIMEntry(md.FilePath, md.SubFilepath)
+		if err != nil {
+			return nil, "", cleanup, err
 		}
-		return nil, cleanup, fmt.Errorf("file %q not found in zip archive %q", bookMetadata.SubFilepath, bookMetadata.FilePath)
+		return bytes.NewReader(buf), EPUB, cleanup, nil
 	default:
-		return nil, cleanup, fmt.Errorf("unknown file type %q", bookMetadata.FileType)
-	}
-
-convert:
-	switch outFormat {
-	case FB2:
-		return sourceFile, cleanup, nil
-	case EPUB:
-		return s.convertBook(sourceFile, EPUB)
-	default:
-		return nil, cleanup, fmt.Errorf("unsupported output format %q", outFormat)
+		return nil, "", cleanup, fmt.Errorf("unknown file type %q", md.FileType)
 	}
 }
 
+// readZipEntry reads a single named entry from a zip archive into memory and
+// returns its bytes and name.
+func readZipEntry(zipPath, subPath string) ([]byte, string, error) {
+	z, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("error opening zip path %q: %w", zipPath, err)
+	}
+	defer z.Close()
+
+	for _, f := range z.File {
+		if f.Name != subPath {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, "", fmt.Errorf("error opening file %q in zip archive %q: %w", f.Name, zipPath, err)
+		}
+		defer rc.Close()
+		buf, err := io.ReadAll(rc)
+		if err != nil {
+			return nil, "", fmt.Errorf("error reading file %q in zip archive %q: %w", f.Name, zipPath, err)
+		}
+		return buf, f.Name, nil
+	}
+	return nil, "", fmt.Errorf("file %q not found in zip archive %q", subPath, zipPath)
+}
+
+func formatFromExt(name string) FileType {
+	switch {
+	case strings.HasSuffix(name, ".epub"):
+		return EPUB
+	case strings.HasSuffix(name, ".fb2"):
+		return FB2
+	default:
+		return FileType(strings.TrimPrefix(filepath.Ext(name), "."))
+	}
+}
+
+// convertBook converts reader from inFormat to outFormat using ebook-convert.
 func (s *Service) convertBook(
 	reader io.Reader,
-	outFormat FileType,
+	inFormat, outFormat FileType,
 ) (
 	file io.Reader,
 	cleanup func(),
 	err error,
 ) {
-	if outFormat != EPUB {
-		return nil, nil, fmt.Errorf("only epub format is supported")
-	}
+	cleanup = func() {}
 
-	sourceTemp := filepath.Join(os.TempDir(), fmt.Sprintf("source-%d.fb2", time.Now().UnixNano()))
+	sourceTemp := filepath.Join(os.TempDir(), fmt.Sprintf("source-%d.%s", time.Now().UnixNano(), inFormat))
 	sourceTempFile, err := os.Create(sourceTemp)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error creating temporary file: %w", err)
+		return nil, cleanup, fmt.Errorf("error creating temporary file: %w", err)
 	}
+	defer os.Remove(sourceTemp)
 
 	if _, err = io.Copy(sourceTempFile, reader); err != nil {
-		return nil, nil, fmt.Errorf("error copying file to temporary file: %w", err)
+		sourceTempFile.Close()
+		return nil, cleanup, fmt.Errorf("error copying file to temporary file: %w", err)
 	}
+	sourceTempFile.Close()
 
-	outTemp := sourceTemp + ".epub"
-
-	defer os.Remove(sourceTemp)
+	outTemp := sourceTemp + "." + string(outFormat)
 	cleanup = func() {
 		os.Remove(outTemp)
 	}
@@ -224,7 +291,7 @@ func (s *Service) convertBook(
 }
 
 func (s *Service) processFile(path string) {
-	if !strings.HasSuffix(path, ".zip") && !strings.HasSuffix(path, ".fb2") {
+	if !isSupportedFile(path) {
 		return
 	}
 	s.filesChan <- path
@@ -237,7 +304,7 @@ func (s *Service) startFileWorker(ctx context.Context) {
 			log.Println("[service] file worker done")
 			return
 		case path := <-s.filesChan:
-			if !strings.HasSuffix(path, ".zip") && !strings.HasSuffix(path, ".fb2") {
+			if !isSupportedFile(path) {
 				continue
 			}
 
@@ -251,82 +318,125 @@ func (s *Service) startFileWorker(ctx context.Context) {
 
 			log.Printf("[service] processing file %q\n", path)
 
-			if strings.HasSuffix(path, ".fb2") {
-				r, err := os.Open(path)
-				if err != nil {
-					log.Printf("[service] error opening file %q: %v\n", path, err)
-					continue
-				}
+			switch {
+			case strings.HasSuffix(path, ".fb2"):
+				s.indexFB2(ctx, path)
+			case strings.HasSuffix(path, ".zip"):
+				s.indexZip(ctx, path)
+			case strings.HasSuffix(path, ".epub"):
+				s.indexEPUB(ctx, path)
+			case strings.HasSuffix(path, ".zim"):
+				s.indexZIM(ctx, path)
+			}
+		}
+	}
+}
 
-				metadata, err := s.readFB2Metadata(r)
-				if err != nil {
-					log.Printf("[service] error reading metadata from file %q: %v\n", path, err)
-					continue
-				}
+func (s *Service) indexFB2(ctx context.Context, path string) {
+	r, err := os.Open(path)
+	if err != nil {
+		log.Printf("[service] error opening file %q: %v\n", path, err)
+		return
+	}
+	defer r.Close()
 
-				metadata.FileType = FB2
-				metadata.FilePath = path
+	metadata, err := s.readFB2Metadata(r)
+	if err != nil {
+		log.Printf("[service] error reading metadata from file %q: %v\n", path, err)
+		return
+	}
 
-				if err := s.store.Store(ctx, []*BookMetadata{metadata}); err != nil {
-					log.Printf("[service] error storing metadata from file %q: %v\n", path, err)
-					continue
-				}
+	metadata.FileType = FB2
+	metadata.FilePath = path
+
+	if err := s.store.Store(ctx, []*BookMetadata{metadata}); err != nil {
+		log.Printf("[service] error storing metadata from file %q: %v\n", path, err)
+	}
+}
+
+func (s *Service) indexZip(ctx context.Context, path string) {
+	z, err := zip.OpenReader(path)
+	if err != nil {
+		log.Printf("[service] error opening zip path %q: %v\n", path, err)
+		return
+	}
+	defer z.Close()
+
+	var mds []*BookMetadata
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, f := range z.File {
+		if !strings.HasSuffix(f.Name, ".fb2") {
+			continue
+		}
+
+		wg.Add(1)
+
+		go func(f *zip.File) {
+			defer wg.Done()
+
+			r, err := f.Open()
+			if err != nil {
+				log.Printf("[service] error opening file %s in zip archive %s: %v\n", f.Name, path, err)
+				return
+			}
+			defer r.Close()
+
+			metadata, err := s.readFB2Metadata(r)
+			if err != nil {
+				log.Printf("[service] error reading metadata from file %s in zip archive %s: %v\n", f.Name, path, err)
+				return
 			}
 
-			if strings.HasSuffix(path, ".zip") {
-				z, err := zip.OpenReader(path)
-				if err != nil {
-					log.Printf("[service] error opening zip path %q: %v\n", path, err)
-					continue
-				}
+			metadata.FileType = ZIP
+			metadata.FilePath = path
+			metadata.SubFilepath = f.Name
 
-				var mds []*BookMetadata
-				var wg sync.WaitGroup
+			mu.Lock()
+			mds = append(mds, metadata)
+			mu.Unlock()
+		}(f)
+	}
 
-				for _, f := range z.File {
-					if !strings.HasSuffix(f.Name, ".fb2") {
-						continue
-					}
+	wg.Wait()
 
-					wg.Add(1)
+	log.Printf("[service] storing %d metadatas from %s\n", len(mds), path)
 
-					go func(f *zip.File) {
-						defer wg.Done()
+	if len(mds) > 0 {
+		if err := s.store.Store(ctx, mds); err != nil {
+			log.Printf("[service] ERROR storing metadata from file %q: %v\n", path, err)
+		}
+	}
+}
 
-						r, err := f.Open()
-						if err != nil {
-							log.Printf("[service] error opening file %s in zip archive %s: %v\n", f.Name, path, err)
-							return
-						}
+func (s *Service) indexEPUB(ctx context.Context, path string) {
+	metadata, err := readEPUBMetadataFromFile(path)
+	if err != nil {
+		log.Printf("[service] error reading metadata from epub %q: %v\n", path, err)
+		return
+	}
 
-						metadata, err := s.readFB2Metadata(r)
-						if err != nil {
-							log.Printf("[service] error reading metadata from file %s in zip archive %s: %v\n", f.Name, path, err)
-							return
-						}
+	metadata.FileType = EPUB
+	metadata.FilePath = path
 
-						metadata.FileType = ZIP
-						metadata.FilePath = path
-						metadata.SubFilepath = f.Name
-						mds = append(mds, metadata)
-					}(f)
-				}
+	if err := s.store.Store(ctx, []*BookMetadata{metadata}); err != nil {
+		log.Printf("[service] error storing metadata from epub %q: %v\n", path, err)
+	}
+}
 
-				log.Printf("[service] waiting for %d workers to finish processing %s\n", len(z.File), path)
+func (s *Service) indexZIM(ctx context.Context, path string) {
+	mds, err := readZIMBooks(path)
+	if err != nil {
+		log.Printf("[service] error reading zim %q: %v\n", path, err)
+		return
+	}
 
-				wg.Wait()
+	log.Printf("[service] storing %d books from zim %s\n", len(mds), path)
 
-				log.Printf("[service] storing %d metadatas from %s\n", len(mds), path)
-
-				if len(mds) > 0 {
-					if err := s.store.Store(ctx, mds); err != nil {
-						log.Printf("[service] ERROR storing metadata from file %q: %v\n", path, err)
-						continue
-					}
-				}
-
-				z.Close()
-			}
+	if len(mds) > 0 {
+		if err := s.store.Store(ctx, mds); err != nil {
+			log.Printf("[service] ERROR storing metadata from zim %q: %v\n", path, err)
 		}
 	}
 }

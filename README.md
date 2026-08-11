@@ -5,7 +5,15 @@
 ![GitHub](https://img.shields.io/github/license/dir01/bookworm)
 
 `bookworm` allows you to :
-- index your books archive (directory containing `.fb2` files or `.zip` archives with `.fb2` files inside)
+- index your books archive, a directory containing any of:
+  - `.fb2` files
+  - `.zip` archives with `.fb2` files inside
+  - `.epub` files
+  - `.zim` archives with `.epub` files inside (e.g. a [Project Gutenberg](https://download.kiwix.org/zim/gutenberg/) library from Kiwix)
 - search for books (by title or author)
 - get the books (as `.fb2` or `.epub`)
+
+Books are served in their original format when possible (an `.epub` source is
+streamed as-is); conversion between `.fb2` and `.epub` uses Calibre's
+`ebook-convert`.
 
