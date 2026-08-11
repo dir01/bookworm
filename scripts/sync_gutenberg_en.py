@@ -183,6 +183,15 @@ def download(url, dst, timeout=60):
                 sys.stderr.write(msg)
                 sys.stderr.flush()
     sys.stderr.write("\n")
+
+    # If the server advertised a length but closed the connection early, read()
+    # returns EOF without raising. Don't promote a truncated .part to a finished
+    # .zim -- leave it in place so the next run resumes from where it stopped.
+    if total is not None and downloaded != total:
+        raise IOError(
+            "incomplete download: got %s of %s; keeping %s for resume"
+            % (human(downloaded), human(total), os.path.basename(part))
+        )
     os.replace(part, dst)
 
 
