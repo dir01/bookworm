@@ -6,6 +6,78 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [v0.51.0]
+### Changed
+- Use ODPI-C v6.0.0
+
+## [v0.50.0]
+### Added
+- StructScan, SliceScan, StructObjectWrite, SliceObjectWrite helpers for implementing what is now behind `godror:"typename,"` struct tags.
+- dsn.PoolParams.NoWait for #396.
+
+### Breaking
+- Remove `godror:"typename"` struct tag scanning - it's complex, error prone and hard to inject. Implement ObjectWriter and ObjectScanner instead (with the help of {Struct,Slice}{WriteObject,Scan} if needed).
+
+## [v0.49.6]
+### Added
+- *bool == nil -> NULL in DB.
+
+## [v0.49.5]
+- ODPI-C v5.6.4
+
+## [v0.49.4]
+### Added
+- New WithQueueTable option for NewQueue.
+### Changed
+- ODPI-C v5.6.3
+- JSON: use strings for numbers (Oracle somewhere uses %f instead of %g).
+
+## [v0.49.3]
+### Fixed
+- JSON: handle empty / null array
+### Added
+- Queue: limit Dequeue to the number of ready messages (to avoid Oracle memory leak)
+
+## [0.49.2]
+### Fixed
+- https://github.com/godror/godror/issues/380
+
+## [0.49.1]
+### Changed
+- The default JSON.String() has changed to JSONoptDefault, so number will be numbers, not strings.
+- ODPI v5.6.2
+
+### Added
+- JSON.StringWithOption allows to convert godror.JSON to string with options (such as JSONoptNumberAsString)
+- JSONAsString and JSONStringOption query/exec options to handle JSON object -> string conversion
+- Queue.{Enqueue,Dequeue}WithOptions to be able to specifiy the dequeue options for one call only.
+
+## [0.48.1]
+### Fixed
+- Fixed a nasty silent cgo (usage) bug for Go1.24 that borked object NUMBER retrieval - see https://github.com/godror/godror/issues/365
+
+## [0.48.0]
+### Added
+- Vector and sparse vector support
+
+## [0.47.1]
+### Fixed
+- Read NCLOB: must count in UTF-16, and don't split surrogates (ORA-22831)
+- Use CallTimeout as context.WithTimeout
+
+## [0.47.0]
+### Changed
+- ConnectionParams IsSysDBA, IsSysOper, IsSysASM -> AdminRole
+
+## [0.46.2]
+### Changed
+- Use ODPI-5.5.0
+
+## [0.46.0]
+### Changed
+- dsn.StandaloneConnection, dsn.Heterogeneous and dsn.ExternalAuth became sql.NullBool to be able to differentiate set and not set.
+- Use ODPI-v5.4.1, fixing SIGSEGV on standalone connection with external auth.
+
 ## [v0.45.2]
 ### Added
 - NoRetry option to disable re-execution of a statement on ORA-04061, ORA-04065 or ORA-04068
@@ -129,7 +201,7 @@ change cause SIGSEGV.
 ## [v0.28.1]
 ### Changed
 - ODPI-C v4.3.0
-### Added 
+### Added
 - Add NewTempLob to the Conn interface for #189.
 
 ## [v0.28.0]
@@ -161,7 +233,7 @@ change cause SIGSEGV.
 ### Changed
 - Use dpiConn_setCallTimeout for faster recovers.
 - Faster setTraceTag, drv.init.
-- Buffer dpiLobReader.Read with chunk-sized reads for 
+- Buffer dpiLobReader.Read with chunk-sized reads for
   * avoiding io.ReadAll short read and
   * performance
 
@@ -209,7 +281,7 @@ the last error on some kind of thead-local-storage.
 
 ### Changed
 - Set DefaultPrefetchCount = DefaultArraySize (=100), from the previous 2.
-- Use SESSIONTIMEZONE instead of DBTIMEZONE. 
+- Use SESSIONTIMEZONE instead of DBTIMEZONE.
 
 ## [0.21.0]
 ### Changed
@@ -281,7 +353,7 @@ the last error on some kind of thead-local-storage.
 - Fixed TimeZone caching and lock issues.
 
 ## [0.17.0]
-### Added 
+### Added
 - PrefetchCount statement option to set prefetch row count.
 
 ### Changed

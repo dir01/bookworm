@@ -1,4 +1,4 @@
-// Copyright 2017, 2020 The Godror Authors
+// Copyright 2017, 2026 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -21,7 +21,6 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
-	"github.com/godror/godror/slog"
 	"io"
 	"math"
 	"reflect"
@@ -30,6 +29,8 @@ import (
 	"strings"
 	"time"
 	"unsafe"
+
+	"github.com/godror/godror/slog"
 )
 
 var _ = driver.Rows((*rows)(nil))
@@ -72,7 +73,7 @@ func (r *rows) Close() error {
 		return nil
 	}
 	vars, st, nextRs := r.vars, r.statement, r.nextRs
-	r.columns, r.vars, r.data, r.statement, r.nextRs = nil, nil, nil, nil, nil
+	r.columns, r.vars, r.data, r.statement, r.nextRs, r.origSt = nil, nil, nil, nil, nil, nil
 	fromData := r.fromData
 	r.fromData = false
 	for _, v := range vars[:cap(vars)] {
@@ -87,7 +88,7 @@ func (r *rows) Close() error {
 		}
 		C.dpiStmt_release(nextRs)
 	}
-	if st == nil {
+	if st == nil || st.dpiStmt == nil {
 		return nil
 	}
 
@@ -123,7 +124,7 @@ func (r *rows) ColumnTypeLength(index int) (length int64, ok bool) {
 		C.DPI_ORACLE_TYPE_BFILE,
 		C.DPI_NATIVE_TYPE_LOB,
 		C.DPI_ORACLE_TYPE_JSON, C.DPI_ORACLE_TYPE_JSON_OBJECT, C.DPI_ORACLE_TYPE_JSON_ARRAY,
-		C.DPI_ORACLE_TYPE_XMLTYPE:
+		C.DPI_ORACLE_TYPE_XMLTYPE, C.DPI_ORACLE_TYPE_VECTOR:
 		return math.MaxInt64, true
 	default:
 		return 0, false
@@ -191,6 +192,8 @@ func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
 		return "JSON"
 	case C.DPI_ORACLE_TYPE_XMLTYPE:
 		return "XMLTYPE"
+	case C.DPI_ORACLE_TYPE_VECTOR:
+		return "VECTOR"
 	default:
 		return fmt.Sprintf("OTHER[%d]", r.columns[index].OracleType)
 	}
@@ -218,6 +221,8 @@ func (r *rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok b
 		//C.DPI_ORACLE_TYPE_NATIVE_UINT, C.DPI_NATIVE_TYPE_UINT64,
 		C.DPI_ORACLE_TYPE_NUMBER:
 		return int64(col.Precision), int64(col.Scale), true
+	case C.DPI_ORACLE_TYPE_TIMESTAMP, C.DPI_ORACLE_TYPE_TIMESTAMP_TZ, C.DPI_ORACLE_TYPE_TIMESTAMP_LTZ:
+		return int64(col.FsPrecision), 0, true
 	default:
 		return 0, 0, false
 	}
@@ -272,6 +277,8 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 		return reflect.TypeOf(JSONObject{})
 	case C.DPI_ORACLE_TYPE_JSON_ARRAY:
 		return reflect.TypeOf(JSONArray{})
+	case C.DPI_ORACLE_TYPE_VECTOR:
+		return reflect.TypeOf(Vector{})
 	default:
 		return reflect.TypeOf("")
 	}
@@ -373,6 +380,9 @@ func (r *rows) Next(dest []driver.Value) error {
 	nullDate := r.statement.NullDate()
 	nass := r.statement.NumberAsString()
 	naf := !nass && r.statement.NumberAsFloat64()
+	jsonAsString := r.statement.JSONAsString()
+	jsonStringOption := r.statement.JSONStringOption()
+	// fmt.Printf("%p.%[2]p stmtOptions=%+[2]v\n", r.statement, &r.statement.stmtOptions)
 
 	//fmt.Printf("bri=%d fetched=%d\n", r.bufferRowIndex, r.fetched)
 	//fmt.Printf("data=%#v\n", r.data[0][r.bufferRowIndex])
@@ -584,7 +594,10 @@ func (r *rows) Next(dest []driver.Value) error {
 				}
 				continue
 			}
-			rdr := &dpiLobReader{dpiLob: C.dpiData_getLOB(d), drv: r.drv, IsClob: isClob}
+			rdr := &dpiLobReader{
+				drv: r.drv, dpiLob: C.dpiData_getLOB(d),
+				IsClob: isClob,
+			}
 			if isClob && (r.ClobAsString() || !r.LobAsReader()) {
 				sb := stringBuilders.Get()
 				_, err := io.Copy(sb, rdr)
@@ -614,7 +627,7 @@ func (r *rows) Next(dest []driver.Value) error {
 				if logger != nil {
 					logger.Error("Next.getNumQueryColumns", "st", fmt.Sprintf("%p", st.dpiStmt), "error", err)
 				}
-				//C.dpiStmt_release(st.dpiStmt)
+				//C.dpiStmt_release(st.dpiStmt)  // don't bork all rows access
 				return fmt.Errorf("getNumQueryColumns: %w", err)
 			}
 			st.Lock()
@@ -628,7 +641,7 @@ func (r *rows) Next(dest []driver.Value) error {
 				return err
 			}
 			r2.fromData = true
-			stmtSetFinalizer(ctx, st, "Next")
+			stmtAddCleanup(ctx, st, "Next")
 			dest[i] = r2
 
 		case C.DPI_ORACLE_TYPE_BOOLEAN, C.DPI_NATIVE_TYPE_BOOLEAN:
@@ -658,7 +671,17 @@ func (r *rows) Next(dest []driver.Value) error {
 			switch col.NativeType {
 			case C.DPI_NATIVE_TYPE_JSON:
 				dj := *((**C.dpiJson)(unsafe.Pointer(&(d.value))))
-				dest[i] = JSON{dpiJson: dj}
+				j := JSON{dpiJson: dj, stringOption: jsonStringOption}
+				if jsonAsString {
+					var err error
+					if dest[i], err = j.StringWithOption(
+						JSONOptNumberAsString, // Type of conversion for numbers but will respect stringOption for final result.
+					); err != nil {
+						return err
+					}
+				} else {
+					dest[i] = j
+				}
 			default:
 			}
 
@@ -667,13 +690,32 @@ func (r *rows) Next(dest []driver.Value) error {
 				dest[i] = nil
 				continue
 			}
-			dest[i] = JSONObject{dpiJsonObject: ((*C.dpiJsonObject)(unsafe.Pointer(&d.value)))}
+			dest[i] = JSONObject{dpiJsonObject: ((*C.dpiJsonObject)(unsafe.Pointer(&d.value))), stringOption: jsonStringOption}
 		case C.DPI_NATIVE_TYPE_JSON_ARRAY:
 			if isNull {
 				dest[i] = nil
 				continue
 			}
-			dest[i] = JSONArray{dpiJsonArray: ((*C.dpiJsonArray)(unsafe.Pointer(&d.value)))}
+			dest[i] = JSONArray{dpiJsonArray: ((*C.dpiJsonArray)(unsafe.Pointer(&d.value))), stringOption: jsonStringOption}
+		case C.DPI_ORACLE_TYPE_VECTOR, C.DPI_NATIVE_TYPE_VECTOR:
+			if isNull {
+				dest[i] = Vector{}
+				continue
+			}
+			var (
+				vectorInfo C.dpiVectorInfo
+				err        error
+			)
+			if err = r.checkExec(func() C.int {
+				return C.dpiVector_getValue(C.dpiData_getVector(d),
+					&vectorInfo)
+			}); err != nil {
+				return err
+			}
+			dest[i], err = GetVectorValue(&vectorInfo)
+			if err != nil {
+				return err
+			}
 
 		default:
 			return fmt.Errorf("unsupported column type %d", typ)
@@ -699,7 +741,7 @@ var _ = driver.Rows((*directRow)(nil))
 type directRow struct {
 	conn   *conn
 	query  string
-	result []interface{}
+	result []any
 	args   []string
 }
 
@@ -736,7 +778,7 @@ func (dr *directRow) Next(dest []driver.Value) error {
 	}
 	switch dr.query {
 	case getConnection:
-		*(dest[0].(*interface{})) = dr.result[0]
+		*(dest[0].(*any)) = dr.result[0]
 	}
 	return nil
 }
@@ -781,7 +823,10 @@ func (r *rows) NextResultSet() error {
 		}
 		return fmt.Errorf("getImplicitResult: %w", io.EOF)
 	}
-	st := &statement{conn: r.conn, dpiStmt: r.nextRs}
+	st := &statement{
+		conn: r.conn, dpiStmt: r.nextRs,
+		stmtOptions: r.statement.stmtOptions,
+	}
 
 	var n C.uint32_t
 	logger := getLogger(context.TODO())
@@ -790,10 +835,10 @@ func (r *rows) NextResultSet() error {
 		if logger != nil {
 			logger.Error("NextResultSet.getNumQueryColumns", "st", fmt.Sprintf("%p", st.dpiStmt), "error", err)
 		}
-		//C.dpiStmt_release(st.dpiStmt)
+		//C.dpiStmt_release(st.dpiStmt)  // don't bork all rows access
 		return err
 	}
-	// keep the originam statement for the succeeding NextResultSet calls.
+	// keep the original statement for the succeeding NextResultSet calls.
 	st.Lock()
 	nr, err := st.openRows(ctx, int(n))
 	st.Unlock()
@@ -804,7 +849,7 @@ func (r *rows) NextResultSet() error {
 		st.Close()
 		return err
 	}
-	stmtSetFinalizer(ctx, st, "NextResultSet")
+	stmtAddCleanup(ctx, st, "NextResultSet")
 	nr.origSt = r.origSt
 	if nr.origSt == nil {
 		nr.origSt = r.statement
