@@ -51,7 +51,11 @@ func (s *SqliteStore) Store(ctx context.Context, metadatas []*BookMetadata) erro
 }
 
 func (s *SqliteStore) insertMetadatasBatch(tx *sqlx.Tx, metadatas []*BookMetadata) error {
-	_, err := tx.NamedExec(`
+	if len(metadatas) == 0 {
+		return nil
+	}
+
+	res, err := tx.NamedExec(`
         INSERT INTO books (
             file_type,
             file_path,
@@ -81,7 +85,19 @@ func (s *SqliteStore) insertMetadatasBatch(tx *sqlx.Tx, metadatas []*BookMetadat
 		return err
 	}
 
-	_, err = tx.NamedExec(`
+	// Mirror exactly the rows this batch just inserted into the FTS index. A
+	// single multi-row INSERT assigns contiguous rowids ending at LastInsertId,
+	// so the batch spans [lastID-len+1, lastID]. Selecting by that rowid range
+	// (rather than by file_path) avoids re-indexing earlier batches of the same
+	// archive, which previously duplicated FTS rows once an archive exceeded
+	// batchSize.
+	lastID, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	firstID := lastID - int64(len(metadatas)) + 1
+
+	_, err = tx.Exec(`
         INSERT INTO books_fts (
             id,
             title,
@@ -92,7 +108,7 @@ func (s *SqliteStore) insertMetadatasBatch(tx *sqlx.Tx, metadatas []*BookMetadat
             title,
             author_last_name,
             author_first_name
-        FROM books WHERE file_path = :file_path`, metadatas)
+        FROM books WHERE id BETWEEN ? AND ?`, firstID, lastID)
 	if err != nil {
 		return err
 	}
