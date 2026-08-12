@@ -1,0 +1,4 @@
+# Collapse vendored dependencies in GitHub diffs / PR review and exclude them
+# from language statistics. These are not authored in this repo.
+vendor/** linguist-vendored
+vendor/** linguist-generated=true
