@@ -20,7 +20,8 @@ import (
 const zimFixture = "testdata/gutenberg_csb_all_2025-10.zim"
 
 func TestReadZIMBooks(t *testing.T) {
-	books, err := readZIMBooks(zimFixture)
+	zr := newZimReader()
+	books, err := zr.books(zimFixture)
 	if err != nil {
 		t.Fatalf("readZIMBooks: %v", err)
 	}
@@ -42,17 +43,35 @@ func TestReadZIMBooks(t *testing.T) {
 	}
 
 	// Round-trip: reopen the first book's blob and confirm it is a zip (EPUB).
-	buf, err := openZIMEntry(zimFixture, books[0].SubFilepath)
+	buf, err := zr.entry(zimFixture, books[0].SubFilepath)
 	if err != nil {
-		t.Fatalf("openZIMEntry(%q): %v", books[0].SubFilepath, err)
+		t.Fatalf("entry(%q): %v", books[0].SubFilepath, err)
 	}
 	if len(buf) < 4 || string(buf[:2]) != "PK" {
 		t.Fatalf("book blob is not a zip/epub (head=%x)", buf[:min(4, len(buf))])
 	}
 }
 
+// A truncated/incomplete ZIM (e.g. a still-copying or interrupted download) must
+// surface as an error rather than yielding a partial book list that indexZIM
+// would persist and IsProcessed would then treat as permanently complete.
+func TestReadZIMBooksTruncatedFails(t *testing.T) {
+	full, err := os.ReadFile(zimFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	truncated := filepath.Join(t.TempDir(), "truncated.zim")
+	if err := os.WriteFile(truncated, full[:len(full)/2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := newZimReader().books(truncated); err == nil {
+		t.Fatal("expected an error for a truncated ZIM; a partial archive would be committed as complete")
+	}
+}
+
 func TestServiceIndexesZIM(t *testing.T) {
-	books, err := readZIMBooks(zimFixture)
+	books, err := newZimReader().books(zimFixture)
 	if err != nil {
 		t.Fatalf("readZIMBooks: %v", err)
 	}
