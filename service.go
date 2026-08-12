@@ -84,7 +84,6 @@ func NewService(path string, store ServiceStore) (*Service, error) {
 		filesChan:   make(chan string),
 		fileWorkers: 5,
 		store:       store,
-		zim:         newZimReader(),
 	}, nil
 }
 
@@ -98,7 +97,6 @@ type Service struct {
 	filesChan   chan string
 	fileWorkers int
 	store       ServiceStore
-	zim         *zimReader
 }
 
 // Run starts the service: starts the file system watcher and required workers
@@ -200,7 +198,7 @@ func (s *Service) openSource(md *BookMetadata) (reader io.Reader, format FileTyp
 		}
 		return bytes.NewReader(buf), formatFromExt(name), cleanup, nil
 	case ZIM:
-		buf, err := s.zim.entry(md.FilePath, md.SubFilepath)
+		buf, err := openZIMEntry(md.FilePath, md.SubFilepath)
 		if err != nil {
 			return nil, "", cleanup, err
 		}
@@ -428,7 +426,7 @@ func (s *Service) indexEPUB(ctx context.Context, path string) {
 }
 
 func (s *Service) indexZIM(ctx context.Context, path string) {
-	mds, err := s.zim.books(path)
+	mds, err := readZIMBooks(path)
 	if err != nil {
 		log.Printf("[service] error reading zim %q: %v\n", path, err)
 		return

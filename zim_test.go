@@ -20,8 +20,7 @@ import (
 const zimFixture = "testdata/gutenberg_csb_all_2025-10.zim"
 
 func TestReadZIMBooks(t *testing.T) {
-	zr := newZimReader()
-	books, err := zr.books(zimFixture)
+	books, err := readZIMBooks(zimFixture)
 	if err != nil {
 		t.Fatalf("readZIMBooks: %v", err)
 	}
@@ -43,9 +42,9 @@ func TestReadZIMBooks(t *testing.T) {
 	}
 
 	// Round-trip: reopen the first book's blob and confirm it is a zip (EPUB).
-	buf, err := zr.entry(zimFixture, books[0].SubFilepath)
+	buf, err := openZIMEntry(zimFixture, books[0].SubFilepath)
 	if err != nil {
-		t.Fatalf("entry(%q): %v", books[0].SubFilepath, err)
+		t.Fatalf("openZIMEntry(%q): %v", books[0].SubFilepath, err)
 	}
 	if len(buf) < 4 || string(buf[:2]) != "PK" {
 		t.Fatalf("book blob is not a zip/epub (head=%x)", buf[:min(4, len(buf))])
@@ -65,13 +64,13 @@ func TestReadZIMBooksTruncatedFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := newZimReader().books(truncated); err == nil {
+	if _, err := readZIMBooks(truncated); err == nil {
 		t.Fatal("expected an error for a truncated ZIM; a partial archive would be committed as complete")
 	}
 }
 
 func TestServiceIndexesZIM(t *testing.T) {
-	books, err := newZimReader().books(zimFixture)
+	books, err := readZIMBooks(zimFixture)
 	if err != nil {
 		t.Fatalf("readZIMBooks: %v", err)
 	}

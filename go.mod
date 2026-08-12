@@ -7,8 +7,8 @@ require (
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/rubenv/sql-migrate v1.8.1
+	github.com/stazelabs/gozim v0.1.0
 	github.com/tamerh/xml-stream-parser v1.5.0
-	github.com/tim-st/go-zim v0.1.3
 	gopkg.in/telebot.v3 v3.3.8
 )
 
@@ -57,7 +57,7 @@ require (
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/tamerh/xpath v1.0.0 // indirect
-	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
+	github.com/ulikunitz/xz v0.5.15 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260811152304-ee035b5b010f // indirect
 	golang.org/x/sys v0.47.0 // indirect
