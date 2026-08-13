@@ -1,27 +1,80 @@
-package main
+package catalog
 
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"runtime"
+
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
-	"sync"
 )
 
-func NewSqliteStore(db *sqlx.DB) *SqliteStore {
-	return &SqliteStore{db: db, mutex: sync.Mutex{}}
+// NewSqliteStore opens the books database at dbPath with two connection pools:
+//
+//   - a write pool limited to a single connection, so writers are serialized by
+//     the driver (no application-level mutex) and never raise SQLITE_BUSY against
+//     each other;
+//   - a read pool with several connections for concurrent Search/GetBook lookups.
+//
+// The database runs in WAL mode (see sqliteDSN), under which readers do not block
+// the writer and the writer does not block readers. This is what decouples a long
+// Store transaction (e.g. indexing a whole ZIM archive) from concurrent searches:
+// with the previous single shared connection guarded by one mutex, every read
+// waited behind the in-flight write.
+func NewSqliteStore(dbPath string) (*SqliteStore, error) {
+	// The write pool takes an immediate lock on BEGIN so a transaction that
+	// starts reading and later writes cannot deadlock against itself on upgrade.
+	writeDB, err := sqlx.Connect("sqlite3", sqliteDSN(dbPath, true))
+	if err != nil {
+		return nil, fmt.Errorf("opening write db %q: %w", dbPath, err)
+	}
+	writeDB.SetMaxOpenConns(1)
+
+	readDB, err := sqlx.Connect("sqlite3", sqliteDSN(dbPath, false))
+	if err != nil {
+		_ = writeDB.Close()
+		return nil, fmt.Errorf("opening read db %q: %w", dbPath, err)
+	}
+	readers := max(4, runtime.NumCPU())
+	readDB.SetMaxOpenConns(readers)
+	readDB.SetMaxIdleConns(readers)
+
+	return &SqliteStore{write: writeDB, read: readDB}, nil
+}
+
+// sqliteDSN builds a mattn/go-sqlite3 DSN with the pragmas we rely on. WAL plus a
+// busy timeout gives us reader/writer concurrency; immediate transaction locking
+// is used only for the write pool.
+func sqliteDSN(path string, immediate bool) string {
+	q := url.Values{}
+	q.Set("_journal_mode", "WAL")
+	q.Set("_synchronous", "NORMAL")
+	q.Set("_busy_timeout", "5000")
+	q.Set("_foreign_keys", "on")
+	if immediate {
+		q.Set("_txlock", "immediate")
+	}
+	return "file:" + path + "?" + q.Encode()
 }
 
 type SqliteStore struct {
-	db    *sqlx.DB
-	mutex sync.Mutex
+	write *sqlx.DB
+	read  *sqlx.DB
+}
+
+// Close releases both connection pools.
+func (s *SqliteStore) Close() error {
+	werr := s.write.Close()
+	rerr := s.read.Close()
+	if werr != nil {
+		return werr
+	}
+	return rerr
 }
 
 func (s *SqliteStore) Store(ctx context.Context, metadatas []*BookMetadata) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	tx, err := s.db.BeginTxx(ctx, nil)
+	tx, err := s.write.BeginTxx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -32,10 +85,7 @@ func (s *SqliteStore) Store(ctx context.Context, metadatas []*BookMetadata) erro
 	batchSize := 500
 
 	for i := 0; i < len(metadatas); i += batchSize {
-		end := i + batchSize
-		if end > len(metadatas) {
-			end = len(metadatas)
-		}
+		end := min(i+batchSize, len(metadatas))
 		if err := s.insertMetadatasBatch(tx, metadatas[i:end]); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("can't store batch (%d/%d): %w", i, len(metadatas), err)
@@ -117,11 +167,8 @@ func (s *SqliteStore) insertMetadatasBatch(tx *sqlx.Tx, metadatas []*BookMetadat
 }
 
 func (s *SqliteStore) IsProcessed(ctx context.Context, path string) (bool, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	var exists bool
-	err := s.db.GetContext(ctx, &exists, "SELECT EXISTS(SELECT 1 FROM books WHERE file_path = ?)", path)
+	err := s.read.GetContext(ctx, &exists, "SELECT EXISTS(SELECT 1 FROM books WHERE file_path = ?)", path)
 	if err != nil {
 		return false, err
 	}
@@ -130,12 +177,9 @@ func (s *SqliteStore) IsProcessed(ctx context.Context, path string) (bool, error
 }
 
 func (s *SqliteStore) Search(ctx context.Context, term string) ([]*BookMetadata, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	var metadatas []*BookMetadata
-	err := s.db.SelectContext(ctx, &metadatas, `
-		SELECT books.* FROM books_fts 
+	err := s.read.SelectContext(ctx, &metadatas, `
+		SELECT books.* FROM books_fts
 		JOIN books ON books.id = books_fts.id
 		WHERE books_fts MATCH $1;
 	`, term)
@@ -147,11 +191,8 @@ func (s *SqliteStore) Search(ctx context.Context, term string) ([]*BookMetadata,
 }
 
 func (s *SqliteStore) GetBook(ctx context.Context, id int64) (*BookMetadata, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	var book BookMetadata
-	err := s.db.GetContext(ctx, &book, "SELECT * FROM books WHERE id = ?", id)
+	err := s.read.GetContext(ctx, &book, "SELECT * FROM books WHERE id = ?", id)
 	if err != nil {
 		return nil, err
 	}

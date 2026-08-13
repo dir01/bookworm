@@ -1,10 +1,12 @@
-package main
+package catalog
 
 import (
 	"encoding/binary"
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"sync"
 
 	zim "github.com/stazelabs/gozim/zim"
 )
@@ -29,31 +31,70 @@ func readZIMBooks(path string) ([]*BookMetadata, error) {
 	}
 	defer a.Close()
 
+	// Reading a blob out of the archive (decompress) is serialized inside gozim
+	// by a single mutex, so the producer loop reads them one at a time. Parsing
+	// the EPUB's zip/OPF, however, is the dominant per-book cost and is lock-free
+	// (it works on a private copy of the bytes), so we fan that out to a pool of
+	// workers. The jobs channel is bounded by the worker count, which also caps
+	// how many EPUB blobs are held in memory at once.
+	type job struct {
+		ref  string
+		data []byte
+	}
+
+	workers := runtime.NumCPU()
+	jobs := make(chan job, workers)
+
+	var mu sync.Mutex
 	var mds []*BookMetadata
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for j := range jobs {
+				md, err := readEPUBMetadataFromBytes(j.data)
+				if err != nil {
+					// A single unreadable EPUB is a per-book data problem, not
+					// archive corruption: skip it so one bad book does not block
+					// the rest.
+					log.Printf("[zim] skipping unreadable epub %q in %q: %v", j.ref, path, err)
+					continue
+				}
+				md.FileType = ZIM
+				md.FilePath = path
+				md.SubFilepath = j.ref
+				mu.Lock()
+				mds = append(mds, md)
+				mu.Unlock()
+			}
+		})
+	}
+
+	// A failure to iterate or read/decompress an entry is treated as archive
+	// corruption (e.g. a truncated or still-copying file): stop, drain the
+	// workers, and return the error so the caller does not persist a partial
+	// archive that IsProcessed would then treat as permanently complete.
+	var readErr error
 	for e, err := range a.AllEntries() {
 		if err != nil {
-			return nil, fmt.Errorf("zim: iterating %q: %w", path, err)
+			readErr = fmt.Errorf("zim: iterating %q: %w", path, err)
+			break
 		}
 		if e.IsRedirect() || e.MIMEType() != epubMimetype {
 			continue
 		}
-
 		data, err := e.ReadContentCopy()
 		if err != nil {
-			return nil, fmt.Errorf("zim: reading %q in %q: %w", e.FullPath(), path, err)
+			readErr = fmt.Errorf("zim: reading %q in %q: %w", e.FullPath(), path, err)
+			break
 		}
-
-		md, err := readEPUBMetadataFromBytes(data)
-		if err != nil {
-			log.Printf("[zim] skipping unreadable epub %q in %q: %v", e.FullPath(), path, err)
-			continue
-		}
-		md.FileType = ZIM
-		md.FilePath = path
-		md.SubFilepath = e.FullPath()
-		mds = append(mds, md)
+		jobs <- job{ref: e.FullPath(), data: data}
 	}
+	close(jobs)
+	wg.Wait()
 
+	if readErr != nil {
+		return nil, readErr
+	}
 	return mds, nil
 }
 

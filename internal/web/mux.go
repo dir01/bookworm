@@ -1,4 +1,4 @@
-package main
+package web
 
 import (
 	"encoding/json"
@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+
+	"github.com/dir01/bookworm/internal/catalog"
 )
 
-func NewHttpMux(svc *Service) *http.ServeMux {
+func NewMux(svc *catalog.Service) *http.ServeMux {
 	mux := http.NewServeMux()
 	h := &httpServer{svc: svc}
 	mux.HandleFunc("/search", h.searchHandler)
@@ -17,7 +19,7 @@ func NewHttpMux(svc *Service) *http.ServeMux {
 }
 
 type httpServer struct {
-	svc *Service
+	svc *catalog.Service
 }
 
 func (h *httpServer) searchHandler(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +32,7 @@ func (h *httpServer) searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := struct {
-		Books []*BookMetadata `json:"books"`
+		Books []*catalog.BookMetadata `json:"books"`
 	}{Books: results}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -44,12 +46,12 @@ func (h *httpServer) bookHandler(w http.ResponseWriter, r *http.Request) {
 	idStr := r.URL.Query().Get("id")
 	formatStr := r.URL.Query().Get("format")
 
-	var format FileType
+	var format catalog.FileType
 	switch formatStr {
 	case "fb2":
-		format = FB2
+		format = catalog.FB2
 	case "epub":
-		format = EPUB
+		format = catalog.EPUB
 	default:
 		http.Error(w, "Invalid format", http.StatusBadRequest)
 		return

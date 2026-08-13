@@ -1,4 +1,4 @@
-package main
+package catalog
 
 import (
 	"archive/zip"
@@ -9,10 +9,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
-	migrate "github.com/rubenv/sql-migrate"
 )
 
 const testContainerXML = `<?xml version="1.0"?>
@@ -117,11 +113,7 @@ func TestSplitAuthor(t *testing.T) {
 // served back unchanged (EPUB -> EPUB is a passthrough, so no ebook-convert is
 // required).
 func TestServiceIndexesEPUB(t *testing.T) {
-	db := sqlx.MustConnect("sqlite3", ":memory:")
-	store := NewSqliteStore(db)
-	if _, err := migrate.Exec(db.DB, "sqlite3", &migrate.FileMigrationSource{Dir: "./db/migrations"}, migrate.Up); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	store, _ := newTestStore(t)
 
 	tempDir := t.TempDir()
 	epubBytes := buildTestEPUB(t, testOPF)

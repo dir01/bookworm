@@ -1,4 +1,4 @@
-package main
+package telegram
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dir01/bookworm/internal/catalog"
 	tele "gopkg.in/telebot.v3"
 )
 
@@ -18,11 +19,11 @@ To start using it, just send a book title or author name to the bot.
 
 const actionDownload = "DOWNLOAD"
 
-func NewTelegramBot(
+func NewBot(
 	token string,
 	authorizedUsers []string,
-	service *Service,
-) (*TelegramBot, error) {
+	service *catalog.Service,
+) (*Bot, error) {
 	b, err := tele.NewBot(tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -30,20 +31,20 @@ func NewTelegramBot(
 	if err != nil {
 		return nil, err
 	}
-	return &TelegramBot{
+	return &Bot{
 		service:         service,
 		bot:             b,
 		authorizedUsers: authorizedUsers,
 	}, nil
 }
 
-type TelegramBot struct {
-	service         *Service
+type Bot struct {
+	service         *catalog.Service
 	bot             *tele.Bot
 	authorizedUsers []string
 }
 
-func (b *TelegramBot) Start() {
+func (b *Bot) Start() {
 	handlers := b.bot.Group()
 	handlers.Use(b.denyUnknownUsersMiddleware)
 	handlers.Handle(tele.OnText, b.handleMessage)
@@ -52,15 +53,15 @@ func (b *TelegramBot) Start() {
 	b.bot.Start()
 }
 
-func (b *TelegramBot) Stop() {
+func (b *Bot) Stop() {
 	b.bot.Stop()
 }
 
-func (b *TelegramBot) handleHelpCmd(c tele.Context) error {
+func (b *Bot) handleHelpCmd(c tele.Context) error {
 	return c.Send(HELP, "Markdown")
 }
 
-func (b *TelegramBot) handleMessage(c tele.Context) error {
+func (b *Bot) handleMessage(c tele.Context) error {
 	text := c.Text()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -82,7 +83,7 @@ func (b *TelegramBot) handleMessage(c tele.Context) error {
 	}
 }
 
-func (b *TelegramBot) sendBooks(c tele.Context, metas []*BookMetadata) error {
+func (b *Bot) sendBooks(c tele.Context, metas []*catalog.BookMetadata) error {
 	for _, m := range metas {
 		bookTitle := fmt.Sprintf("[%s %s] - %s", m.AuthorLastName, m.AuthorFirstName, m.Title)
 		if m.Date != "" {
@@ -104,7 +105,7 @@ func (b *TelegramBot) sendBooks(c tele.Context, metas []*BookMetadata) error {
 	return nil
 }
 
-func (b *TelegramBot) handleDownloadCmd(c tele.Context) error {
+func (b *Bot) handleDownloadCmd(c tele.Context) error {
 	data := c.Callback().Data
 	parts := strings.Split(data, "|")
 	if len(parts) != 2 || parts[0] != "epub" {
@@ -122,7 +123,7 @@ func (b *TelegramBot) handleDownloadCmd(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	reader, cleanup, err := b.service.GetBook(ctx, id, EPUB)
+	reader, cleanup, err := b.service.GetBook(ctx, id, catalog.EPUB)
 	if err != nil {
 		log.Printf("[bot] error getting book: %v", err)
 		_ = c.Send("Sorry, something went wrong, please try again later")
@@ -142,7 +143,7 @@ func (b *TelegramBot) handleDownloadCmd(c tele.Context) error {
 	return c.Respond()
 }
 
-func (b *TelegramBot) denyUnknownUsersMiddleware(next tele.HandlerFunc) tele.HandlerFunc {
+func (b *Bot) denyUnknownUsersMiddleware(next tele.HandlerFunc) tele.HandlerFunc {
 	return func(c tele.Context) error {
 		userID := c.Sender().ID
 		userName := c.Sender().Username

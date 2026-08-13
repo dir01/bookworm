@@ -1,8 +1,9 @@
-package main
+package catalog
 
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/jmoiron/sqlx"
@@ -10,13 +11,29 @@ import (
 	migrate "github.com/rubenv/sql-migrate"
 )
 
+// newTestStore creates a store backed by a fresh on-disk database (WAL mode needs
+// a real file — two pools against ":memory:" would see two separate databases)
+// and returns it alongside a plain connection to the same file for raw
+// assertions. Both are closed when the test finishes.
 func newTestStore(t *testing.T) (*SqliteStore, *sqlx.DB) {
 	t.Helper()
-	db := sqlx.MustConnect("sqlite3", ":memory:")
-	if _, err := migrate.Exec(db.DB, "sqlite3", &migrate.FileMigrationSource{Dir: "./db/migrations"}, migrate.Up); err != nil {
+	dbPath := filepath.Join(t.TempDir(), "books.db")
+
+	db := sqlx.MustConnect("sqlite3", sqliteDSN(dbPath, false))
+	if _, err := migrate.Exec(db.DB, "sqlite3", &migrate.FileMigrationSource{Dir: "../../db/migrations"}, migrate.Up); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
-	return NewSqliteStore(db), db
+
+	store, err := NewSqliteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSqliteStore: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = store.Close()
+		_ = db.Close()
+	})
+	return store, db
 }
 
 // A large archive (e.g. a Project Gutenberg ZIM) is stored in a single Store

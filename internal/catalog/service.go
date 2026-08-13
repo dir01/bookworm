@@ -1,4 +1,4 @@
-package main
+package catalog
 
 import (
 	"archive/zip"
@@ -166,7 +166,7 @@ func (s *Service) GetBook(ctx context.Context, id int64, outFormat FileType) (
 		return source, closeSource, nil
 	}
 
-	converted, removeConverted, err := s.convertBook(source, sourceFormat, outFormat)
+	converted, removeConverted, err := s.convertBook(ctx, source, sourceFormat, outFormat)
 	cleanup = func() {
 		removeConverted()
 		closeSource()
@@ -247,7 +247,10 @@ func formatFromExt(name string) FileType {
 }
 
 // convertBook converts reader from inFormat to outFormat using ebook-convert.
+// The context bounds the ebook-convert subprocess: if it is cancelled (e.g. the
+// caller's deadline elapses), the process is killed instead of running on.
 func (s *Service) convertBook(
+	ctx context.Context,
 	reader io.Reader,
 	inFormat, outFormat FileType,
 ) (
@@ -257,11 +260,14 @@ func (s *Service) convertBook(
 ) {
 	cleanup = func() {}
 
-	sourceTemp := filepath.Join(os.TempDir(), fmt.Sprintf("source-%d.%s", time.Now().UnixNano(), inFormat))
-	sourceTempFile, err := os.Create(sourceTemp)
+	// ebook-convert infers the source/target format from the file extension, so
+	// the temp names must end in the right one. os.CreateTemp fills the "*" with a
+	// unique token, giving us a collision-free name without hand-rolling one.
+	sourceTempFile, err := os.CreateTemp("", "bookworm-source-*."+string(inFormat))
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("error creating temporary file: %w", err)
 	}
+	sourceTemp := sourceTempFile.Name()
 	defer os.Remove(sourceTemp)
 
 	if _, err = io.Copy(sourceTempFile, reader); err != nil {
@@ -276,7 +282,7 @@ func (s *Service) convertBook(
 	}
 
 	var stderr bytes.Buffer
-	cmd := exec.Command("ebook-convert", sourceTemp, outTemp)
+	cmd := exec.CommandContext(ctx, "ebook-convert", sourceTemp, outTemp)
 	cmd.Stderr = &stderr
 	if err = cmd.Run(); err != nil {
 		return nil, cleanup, fmt.Errorf("failed to convert file: %w, %s", err, stderr.String())
@@ -446,7 +452,16 @@ func (s *Service) readFB2Metadata(r io.ReadCloser) (*BookMetadata, error) {
 	parser := xmlparser.NewXMLParser(br, "title-info").EnableXpath()
 
 	m := &BookMetadata{}
+	// Keep draining the (buffered) channel even after an error so the parser
+	// goroutine can finish and does not leak; surface the first error afterwards.
+	var parseErr error
 	for xml := range parser.Stream() {
+		if xml.Err != nil {
+			if parseErr == nil {
+				parseErr = xml.Err
+			}
+			continue
+		}
 		if title, err := xml.SelectElements("/book-title"); err == nil && len(title) > 0 {
 			m.Title = title[0].InnerText
 		}
@@ -473,6 +488,16 @@ func (s *Service) readFB2Metadata(r io.ReadCloser) (*BookMetadata, error) {
 		}
 	}
 
+	if parseErr != nil {
+		return nil, fmt.Errorf("parsing fb2: %w", parseErr)
+	}
+	// A well-formed FB2 always carries a book-title in its title-info; an empty
+	// title means we didn't actually parse a book, so refuse it rather than
+	// persisting an empty row that pollutes search results.
+	if m.Title == "" {
+		return nil, fmt.Errorf("fb2 has no book title (unparseable or not an fb2)")
+	}
+
 	return m, nil
 }
 
@@ -483,6 +508,10 @@ func (s *Service) startFSWatcher(ctx context.Context) error {
 	}
 
 	debounceDuration := time.Millisecond * 500
+	// debounceTimers is touched both here (in the watcher goroutine) and from the
+	// AfterFunc callbacks below, which fire on their own goroutines, so it must be
+	// guarded: a concurrent map write would otherwise crash the process.
+	var debounceMu sync.Mutex
 	debounceTimers := make(map[string]*time.Timer)
 
 	go func() {
@@ -500,14 +529,19 @@ func (s *Service) startFSWatcher(ctx context.Context) error {
 				log.Printf("[fsnotify] event: %v\n", event)
 				mask := fsnotify.Create | fsnotify.Rename | fsnotify.Write
 				if event.Op&mask != 0 {
-					if timer, exists := debounceTimers[event.Name]; exists {
+					name := event.Name
+					debounceMu.Lock()
+					if timer, exists := debounceTimers[name]; exists {
 						timer.Reset(debounceDuration)
 					} else {
-						debounceTimers[event.Name] = time.AfterFunc(debounceDuration, func() {
-							s.processFile(event.Name)
-							delete(debounceTimers, event.Name)
+						debounceTimers[name] = time.AfterFunc(debounceDuration, func() {
+							s.processFile(name)
+							debounceMu.Lock()
+							delete(debounceTimers, name)
+							debounceMu.Unlock()
 						})
 					}
+					debounceMu.Unlock()
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {

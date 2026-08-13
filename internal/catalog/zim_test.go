@@ -1,4 +1,4 @@
-package main
+package catalog
 
 import (
 	"context"
@@ -9,10 +9,6 @@ import (
 	"testing"
 	"time"
 	"unicode"
-
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
-	migrate "github.com/rubenv/sql-migrate"
 )
 
 // zimFixture is a small Project Gutenberg ZIM archive kept in testdata. See
@@ -79,11 +75,7 @@ func TestServiceIndexesZIM(t *testing.T) {
 		t.Fatalf("fixture has no book with a searchable title word")
 	}
 
-	db := sqlx.MustConnect("sqlite3", ":memory:")
-	store := NewSqliteStore(db)
-	if _, err := migrate.Exec(db.DB, "sqlite3", &migrate.FileMigrationSource{Dir: "./db/migrations"}, migrate.Up); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	store, _ := newTestStore(t)
 
 	// Copy the fixture into an isolated dir so the scanner sees only the ZIM.
 	tempDir := t.TempDir()

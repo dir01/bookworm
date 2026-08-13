@@ -1,34 +1,22 @@
-package main
+package catalog
 
 import (
 	"archive/zip"
 	"context"
-	"github.com/jmoiron/sqlx"
-	migrate "github.com/rubenv/sql-migrate"
 	"os"
 	"path"
 	"path/filepath"
 	"testing"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestService(t *testing.T) {
 	mkSvc := func() (tempDir string, svc *Service) {
-		db := sqlx.MustConnect("sqlite3", ":memory:")
-		store := NewSqliteStore(db)
-
-		migrations := &migrate.FileMigrationSource{
-			Dir: "./db/migrations",
-		}
-		_, err := migrate.Exec(db.DB, "sqlite3", migrations, migrate.Up)
-		if err != nil {
-			t.Fatalf("failed to apply migrations: %v", err)
-		}
+		store, _ := newTestStore(t)
 
 		tempDir = t.TempDir()
 
+		var err error
 		svc, err = NewService(tempDir, store)
 		if err != nil {
 			t.Fatalf("can't create service: %v", err)
