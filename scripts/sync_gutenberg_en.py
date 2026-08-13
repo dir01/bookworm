@@ -33,6 +33,7 @@ import argparse
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 BASE_URL = "https://lb.download.kiwix.org/zim/gutenberg/"
@@ -147,6 +148,16 @@ def human(nbytes):
         n /= 1024
 
 
+def range_total(headers):
+    """Parse the total size from a 416 response's 'Content-Range: bytes */<total>'."""
+    value = headers.get("Content-Range") if headers else None
+    if value and "/" in value:
+        tail = value.rsplit("/", 1)[-1].strip()
+        if tail.isdigit():
+            return int(tail)
+    return None
+
+
 def download(url, dst, timeout=60):
     """Download url to dst with resume support via a .part file."""
     part = dst + ".part"
@@ -157,7 +168,23 @@ def download(url, dst, timeout=60):
         headers["Range"] = "bytes=%d-" % have
 
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have:
+            # Requested range is past EOF: the .part is already the whole file (a
+            # previous run finished downloading but was killed before the rename)
+            # or is longer than the server's file. Promote it if the size matches,
+            # otherwise discard it and start over from scratch.
+            total = range_total(e.headers)
+            e.close()
+            if total is not None and have == total:
+                os.replace(part, dst)
+                return
+            os.remove(part)
+            return download(url, dst, timeout=timeout)
+        raise
+    with resp:
         resuming = resp.status == 206 and resp.headers.get("Content-Range")
         if have and not resuming:
             # Server ignored our Range; start over from scratch.
