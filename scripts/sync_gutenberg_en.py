@@ -158,6 +158,22 @@ def range_total(headers):
     return None
 
 
+def parse_content_range(value):
+    """Parse a 206 'Content-Range: bytes <start>-<end>/<total>' header.
+
+    Return ``(start, end, total)`` as ints, with any missing/unparseable
+    component (e.g. a '*' total) as ``None``. Returns ``(None, None, None)`` when
+    the header is absent or malformed.
+    """
+    if not value:
+        return None, None, None
+    m = re.match(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", value)
+    if not m:
+        return None, None, None
+    total = int(m.group(3)) if m.group(3) != "*" else None
+    return int(m.group(1)), int(m.group(2)), total
+
+
 def download(url, dst, timeout=60):
     """Download url to dst with resume support via a .part file."""
     part = dst + ".part"
@@ -184,32 +200,53 @@ def download(url, dst, timeout=60):
             os.remove(part)
             return download(url, dst, timeout=timeout)
         raise
+    restart = False
+    total = None
     with resp:
-        resuming = resp.status == 206 and resp.headers.get("Content-Range")
-        if have and not resuming:
-            # Server ignored our Range; start over from scratch.
-            have = 0
+        if have and resp.status == 206 and resp.headers.get("Content-Range"):
+            # Resuming. Trust the resource length from Content-Range
+            # ("bytes <start>-<end>/<total>") as authoritative rather than
+            # assuming the 206 segment runs to EOF: a server that answers our
+            # open-ended "bytes=<have>-" with a shorter sub-range would otherwise
+            # make total = have + Content-Length under-count the real size, and
+            # the truncated .part would be promoted to a finished .zim. If the
+            # server resumed from an unexpected offset (or withheld the total) we
+            # cannot safely append, so discard the .part and start over.
+            start, _end, size = parse_content_range(resp.headers.get("Content-Range"))
+            if start == have and size is not None:
+                total = size
+            else:
+                restart = True
+        else:
+            if have:
+                # Server ignored our Range (200, or 206 without Content-Range);
+                # start over from scratch.
+                have = 0
+            remaining = resp.headers.get("Content-Length")
+            total = int(remaining) if remaining is not None else None
 
-        remaining = resp.headers.get("Content-Length")
-        total = (have + int(remaining)) if remaining is not None else None
+        if not restart:
+            mode = "ab" if have else "wb"
+            downloaded = have
+            with open(part, mode) as f:
+                while True:
+                    chunk = resp.read(1024 * 256)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = 100.0 * downloaded / total
+                        msg = "\r  %s / %s (%.1f%%)" % (human(downloaded), human(total), pct)
+                    else:
+                        msg = "\r  %s" % human(downloaded)
+                    sys.stderr.write(msg)
+                    sys.stderr.flush()
+            sys.stderr.write("\n")
 
-        mode = "ab" if have else "wb"
-        downloaded = have
-        with open(part, mode) as f:
-            while True:
-                chunk = resp.read(1024 * 256)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = 100.0 * downloaded / total
-                    msg = "\r  %s / %s (%.1f%%)" % (human(downloaded), human(total), pct)
-                else:
-                    msg = "\r  %s" % human(downloaded)
-                sys.stderr.write(msg)
-                sys.stderr.flush()
-    sys.stderr.write("\n")
+    if restart:
+        os.remove(part)
+        return download(url, dst, timeout=timeout)
 
     # If the server advertised a length but closed the connection early, read()
     # returns EOF without raising. Don't promote a truncated .part to a finished
