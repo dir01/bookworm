@@ -15,7 +15,7 @@ import (
 // a real file — two pools against ":memory:" would see two separate databases)
 // and returns it alongside a plain connection to the same file for raw
 // assertions. Both are closed when the test finishes.
-func newTestStore(t *testing.T) (*SqliteStore, *sqlx.DB) {
+func newTestStore(t *testing.T) (*SQLiteStore, *sqlx.DB) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "books.db")
 
@@ -24,9 +24,9 @@ func newTestStore(t *testing.T) (*SqliteStore, *sqlx.DB) {
 		t.Fatalf("migrations: %v", err)
 	}
 
-	store, err := NewSqliteStore(dbPath)
+	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
-		t.Fatalf("NewSqliteStore: %v", err)
+		t.Fatalf("NewSQLiteStore: %v", err)
 	}
 
 	t.Cleanup(func() {

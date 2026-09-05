@@ -11,13 +11,11 @@ import (
 	zim "github.com/stazelabs/gozim/zim"
 )
 
-// epubMimetype is the ZIM entry mimetype for a Project Gutenberg book.
-const epubMimetype = "application/epub+zip"
-
-// readZIMBooks enumerates every EPUB entry in a ZIM archive (e.g. a Project
-// Gutenberg library) and returns one BookMetadata per book. FileType, FilePath
-// and SubFilepath (the entry's namespaced full path, e.g. "C/Title.123.epub")
-// are populated so the entry can be reopened on download.
+// readZIMBooks enumerates every book entry in a ZIM archive (e.g. a Project
+// Gutenberg library) and returns one BookMetadata per book. Entries are selected
+// by MIME type, so any supported leaf format (EPUB, FB2) is indexed. FileType,
+// FilePath and SubFilepath (the entry's namespaced full path, e.g.
+// "C/Title.123.epub") are populated so the entry can be reopened on download.
 //
 // A failure to read/decompress an entry is treated as archive corruption (e.g. a
 // truncated or still-copying file) and returned as an error, so the caller does
@@ -33,13 +31,14 @@ func readZIMBooks(path string) ([]*BookMetadata, error) {
 
 	// Reading a blob out of the archive (decompress) is serialized inside gozim
 	// by a single mutex, so the producer loop reads them one at a time. Parsing
-	// the EPUB's zip/OPF, however, is the dominant per-book cost and is lock-free
-	// (it works on a private copy of the bytes), so we fan that out to a pool of
-	// workers. The jobs channel is bounded by the worker count, which also caps
-	// how many EPUB blobs are held in memory at once.
+	// the book (an EPUB's zip/OPF, an FB2's XML), however, is the dominant
+	// per-book cost and is lock-free (it works on a private copy of the bytes),
+	// so we fan that out to a pool of workers. The jobs channel is bounded by the
+	// worker count, which also caps how many blobs are held in memory at once.
 	type job struct {
-		ref  string
-		data []byte
+		ref    string
+		format FileType
+		data   []byte
 	}
 
 	workers := runtime.NumCPU()
@@ -51,12 +50,12 @@ func readZIMBooks(path string) ([]*BookMetadata, error) {
 	for range workers {
 		wg.Go(func() {
 			for j := range jobs {
-				md, err := readEPUBMetadataFromBytes(j.data)
+				md, err := readLeafMetadata(j.format, j.data)
 				if err != nil {
-					// A single unreadable EPUB is a per-book data problem, not
+					// A single unreadable book is a per-book data problem, not
 					// archive corruption: skip it so one bad book does not block
 					// the rest.
-					log.Printf("[zim] skipping unreadable epub %q in %q: %v", j.ref, path, err)
+					log.Printf("[zim] skipping unreadable book %q in %q: %v", j.ref, path, err)
 					continue
 				}
 				md.FileType = ZIM
@@ -79,7 +78,8 @@ func readZIMBooks(path string) ([]*BookMetadata, error) {
 			readErr = fmt.Errorf("zim: iterating %q: %w", path, err)
 			break
 		}
-		if e.IsRedirect() || e.MIMEType() != epubMimetype {
+		format, ok := leafFormatFromMIME(e.MIMEType())
+		if e.IsRedirect() || !ok {
 			continue
 		}
 		data, err := e.ReadContentCopy()
@@ -87,7 +87,7 @@ func readZIMBooks(path string) ([]*BookMetadata, error) {
 			readErr = fmt.Errorf("zim: reading %q in %q: %w", e.FullPath(), path, err)
 			break
 		}
-		jobs <- job{ref: e.FullPath(), data: data}
+		jobs <- job{ref: e.FullPath(), format: format, data: data}
 	}
 	close(jobs)
 	wg.Wait()
@@ -98,23 +98,28 @@ func readZIMBooks(path string) ([]*BookMetadata, error) {
 	return mds, nil
 }
 
-// openZIMEntry reopens the EPUB blob for a stored entry reference (the entry's
-// namespaced full path) and returns its bytes.
-func openZIMEntry(path, ref string) ([]byte, error) {
+// openZIMEntry reopens the book blob for a stored entry reference (the entry's
+// namespaced full path) and returns its bytes together with the entry's MIME
+// type, from which the caller derives the leaf format.
+func openZIMEntry(path, ref string) ([]byte, string, error) {
 	a, err := openZIMArchive(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer a.Close()
 
 	e, err := a.EntryByPath(ref)
 	if err != nil {
-		return nil, fmt.Errorf("zim: entry %q not found in %q: %w", ref, path, err)
+		return nil, "", fmt.Errorf("zim: entry %q not found in %q: %w", ref, path, err)
 	}
 	if e, err = e.Resolve(); err != nil {
-		return nil, fmt.Errorf("zim: resolving %q in %q: %w", ref, path, err)
+		return nil, "", fmt.Errorf("zim: resolving %q in %q: %w", ref, path, err)
 	}
-	return e.ReadContentCopy()
+	data, err := e.ReadContentCopy()
+	if err != nil {
+		return nil, "", fmt.Errorf("zim: reading %q in %q: %w", ref, path, err)
+	}
+	return data, e.MIMEType(), nil
 }
 
 // openZIMArchive opens a ZIM archive after verifying it is complete.

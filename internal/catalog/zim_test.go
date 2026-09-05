@@ -38,9 +38,12 @@ func TestReadZIMBooks(t *testing.T) {
 	}
 
 	// Round-trip: reopen the first book's blob and confirm it is a zip (EPUB).
-	buf, err := openZIMEntry(zimFixture, books[0].SubFilepath)
+	buf, mimeType, err := openZIMEntry(zimFixture, books[0].SubFilepath)
 	if err != nil {
 		t.Fatalf("openZIMEntry(%q): %v", books[0].SubFilepath, err)
+	}
+	if _, ok := leafFormatFromMIME(mimeType); !ok {
+		t.Fatalf("openZIMEntry returned unsupported MIME type %q", mimeType)
 	}
 	if len(buf) < 4 || string(buf[:2]) != "PK" {
 		t.Fatalf("book blob is not a zip/epub (head=%x)", buf[:min(4, len(buf))])

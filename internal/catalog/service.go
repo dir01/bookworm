@@ -41,7 +41,7 @@ type BookMetadata struct {
 	// Database ID
 	ID int64 `db:"id"`
 
-	// Zip or FB2
+	// ZIP or FB2
 	FileType FileType `db:"file_type"`
 
 	// Relative to the directory
@@ -192,25 +192,29 @@ func (s *Service) openSource(md *BookMetadata) (reader io.Reader, format FileTyp
 		}
 		return f, md.FileType, func() { f.Close() }, nil
 	case ZIP:
-		buf, name, err := readZipEntry(md.FilePath, md.SubFilepath)
+		buf, name, err := readZIPEntry(md.FilePath, md.SubFilepath)
 		if err != nil {
 			return nil, "", cleanup, err
 		}
 		return bytes.NewReader(buf), formatFromExt(name), cleanup, nil
 	case ZIM:
-		buf, err := openZIMEntry(md.FilePath, md.SubFilepath)
+		buf, mimeType, err := openZIMEntry(md.FilePath, md.SubFilepath)
 		if err != nil {
 			return nil, "", cleanup, err
 		}
-		return bytes.NewReader(buf), EPUB, cleanup, nil
+		format, ok := leafFormatFromMIME(mimeType)
+		if !ok {
+			return nil, "", cleanup, fmt.Errorf("zim entry %q has unsupported MIME type %q", md.SubFilepath, mimeType)
+		}
+		return bytes.NewReader(buf), format, cleanup, nil
 	default:
 		return nil, "", cleanup, fmt.Errorf("unknown file type %q", md.FileType)
 	}
 }
 
-// readZipEntry reads a single named entry from a zip archive into memory and
+// readZIPEntry reads a single named entry from a zip archive into memory and
 // returns its bytes and name.
-func readZipEntry(zipPath, subPath string) ([]byte, string, error) {
+func readZIPEntry(zipPath, subPath string) ([]byte, string, error) {
 	z, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("error opening zip path %q: %w", zipPath, err)
@@ -221,29 +225,74 @@ func readZipEntry(zipPath, subPath string) ([]byte, string, error) {
 		if f.Name != subPath {
 			continue
 		}
-		rc, err := f.Open()
+		buf, err := readZIPFile(f)
 		if err != nil {
-			return nil, "", fmt.Errorf("error opening file %q in zip archive %q: %w", f.Name, zipPath, err)
-		}
-		defer rc.Close()
-		buf, err := io.ReadAll(rc)
-		if err != nil {
-			return nil, "", fmt.Errorf("error reading file %q in zip archive %q: %w", f.Name, zipPath, err)
+			return nil, "", fmt.Errorf("in zip archive %q: %w", zipPath, err)
 		}
 		return buf, f.Name, nil
 	}
 	return nil, "", fmt.Errorf("file %q not found in zip archive %q", subPath, zipPath)
 }
 
-func formatFromExt(name string) FileType {
-	switch {
-	case strings.HasSuffix(name, ".epub"):
-		return EPUB
-	case strings.HasSuffix(name, ".fb2"):
-		return FB2
-	default:
-		return FileType(strings.TrimPrefix(filepath.Ext(name), "."))
+// readZIPFile reads a single zip entry fully into memory.
+func readZIPFile(f *zip.File) ([]byte, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return nil, fmt.Errorf("error opening %q: %w", f.Name, err)
 	}
+	defer rc.Close()
+	buf, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, fmt.Errorf("error reading %q: %w", f.Name, err)
+	}
+	return buf, nil
+}
+
+// leafFormatFromName reports the book format of a container entry from its file
+// name, and whether it is a leaf format we can index. "Leaf" formats are actual
+// books (FB2, EPUB), as opposed to the containers (.zip, .zim) that hold them.
+func leafFormatFromName(name string) (FileType, bool) {
+	switch {
+	case strings.HasSuffix(name, ".fb2"):
+		return FB2, true
+	case strings.HasSuffix(name, ".epub"):
+		return EPUB, true
+	}
+	return "", false
+}
+
+// leafFormatFromMIME is the ZIM-native counterpart of leafFormatFromName: ZIM
+// entries carry a MIME type rather than a file extension.
+func leafFormatFromMIME(mime string) (FileType, bool) {
+	switch mime {
+	case "application/epub+zip":
+		return EPUB, true
+	case "application/x-fictionbook+xml", "text/fb2+xml":
+		return FB2, true
+	}
+	return "", false
+}
+
+// readLeafMetadata parses metadata from the raw bytes of a single book in the
+// given leaf format. It is the one place mapping a format to its parser, so any
+// container (a .zip entry, a .zim blob) can index any supported book type.
+func readLeafMetadata(format FileType, data []byte) (*BookMetadata, error) {
+	switch format {
+	case FB2:
+		return readFB2Metadata(bytes.NewReader(data))
+	case EPUB:
+		return readEPUBMetadataFromBytes(data)
+	}
+	return nil, fmt.Errorf("unsupported leaf format %q", format)
+}
+
+// formatFromExt maps a file name to its book format, falling back to the raw
+// extension for names that are not a recognized leaf format.
+func formatFromExt(name string) FileType {
+	if f, ok := leafFormatFromName(name); ok {
+		return f
+	}
+	return FileType(strings.TrimPrefix(filepath.Ext(name), "."))
 }
 
 // convertBook converts reader from inFormat to outFormat using ebook-convert.
@@ -328,7 +377,7 @@ func (s *Service) startFileWorker(ctx context.Context) {
 			case strings.HasSuffix(path, ".fb2"):
 				s.indexFB2(ctx, path)
 			case strings.HasSuffix(path, ".zip"):
-				s.indexZip(ctx, path)
+				s.indexZIP(ctx, path)
 			case strings.HasSuffix(path, ".epub"):
 				s.indexEPUB(ctx, path)
 			case strings.HasSuffix(path, ".zim"):
@@ -346,7 +395,7 @@ func (s *Service) indexFB2(ctx context.Context, path string) {
 	}
 	defer r.Close()
 
-	metadata, err := s.readFB2Metadata(r)
+	metadata, err := readFB2Metadata(r)
 	if err != nil {
 		log.Printf("[service] error reading metadata from file %q: %v\n", path, err)
 		return
@@ -360,7 +409,7 @@ func (s *Service) indexFB2(ctx context.Context, path string) {
 	}
 }
 
-func (s *Service) indexZip(ctx context.Context, path string) {
+func (s *Service) indexZIP(ctx context.Context, path string) {
 	z, err := zip.OpenReader(path)
 	if err != nil {
 		log.Printf("[service] error opening zip path %q: %v\n", path, err)
@@ -373,25 +422,25 @@ func (s *Service) indexZip(ctx context.Context, path string) {
 	var wg sync.WaitGroup
 
 	for _, f := range z.File {
-		if !strings.HasSuffix(f.Name, ".fb2") {
+		format, ok := leafFormatFromName(f.Name)
+		if !ok {
 			continue
 		}
 
 		wg.Add(1)
 
-		go func(f *zip.File) {
+		go func(f *zip.File, format FileType) {
 			defer wg.Done()
 
-			r, err := f.Open()
+			data, err := readZIPFile(f)
 			if err != nil {
-				log.Printf("[service] error opening file %s in zip archive %s: %v\n", f.Name, path, err)
+				log.Printf("[service] error reading %s in zip archive %s: %v\n", f.Name, path, err)
 				return
 			}
-			defer r.Close()
 
-			metadata, err := s.readFB2Metadata(r)
+			metadata, err := readLeafMetadata(format, data)
 			if err != nil {
-				log.Printf("[service] error reading metadata from file %s in zip archive %s: %v\n", f.Name, path, err)
+				log.Printf("[service] error reading metadata from %s in zip archive %s: %v\n", f.Name, path, err)
 				return
 			}
 
@@ -402,7 +451,7 @@ func (s *Service) indexZip(ctx context.Context, path string) {
 			mu.Lock()
 			mds = append(mds, metadata)
 			mu.Unlock()
-		}(f)
+		}(f, format)
 	}
 
 	wg.Wait()
@@ -447,7 +496,7 @@ func (s *Service) indexZIM(ctx context.Context, path string) {
 	}
 }
 
-func (s *Service) readFB2Metadata(r io.ReadCloser) (*BookMetadata, error) {
+func readFB2Metadata(r io.Reader) (*BookMetadata, error) {
 	br := bufio.NewReaderSize(r, 1024)
 	parser := xmlparser.NewXMLParser(br, "title-info").EnableXpath()
 
@@ -507,12 +556,7 @@ func (s *Service) startFSWatcher(ctx context.Context) error {
 		return fmt.Errorf("can't create watcher: %w", err)
 	}
 
-	debounceDuration := time.Millisecond * 500
-	// debounceTimers is touched both here (in the watcher goroutine) and from the
-	// AfterFunc callbacks below, which fire on their own goroutines, so it must be
-	// guarded: a concurrent map write would otherwise crash the process.
-	var debounceMu sync.Mutex
-	debounceTimers := make(map[string]*time.Timer)
+	debouncer := newPathDebouncer(500*time.Millisecond, s.processFile)
 
 	go func() {
 		defer watcher.Close()
@@ -527,21 +571,9 @@ func (s *Service) startFSWatcher(ctx context.Context) error {
 					return
 				}
 				log.Printf("[fsnotify] event: %v\n", event)
-				mask := fsnotify.Create | fsnotify.Rename | fsnotify.Write
-				if event.Op&mask != 0 {
-					name := event.Name
-					debounceMu.Lock()
-					if timer, exists := debounceTimers[name]; exists {
-						timer.Reset(debounceDuration)
-					} else {
-						debounceTimers[name] = time.AfterFunc(debounceDuration, func() {
-							s.processFile(name)
-							debounceMu.Lock()
-							delete(debounceTimers, name)
-							debounceMu.Unlock()
-						})
-					}
-					debounceMu.Unlock()
+				isEligibleEvent := 0 != event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Write)
+				if isEligibleEvent {
+					debouncer.trigger(event.Name)
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -561,4 +593,44 @@ func (s *Service) startFSWatcher(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// pathDebouncer coalesces rapid filesystem events for the same path into a
+// single call to fn, fired once the path has been quiet for duration. This
+// smooths over the burst of events an editor or copy emits while writing a file.
+type pathDebouncer struct {
+	duration time.Duration
+	fn       func(string)
+
+	// timers is touched both from trigger (the watcher goroutine) and from the
+	// AfterFunc callbacks, which fire on their own goroutines, so it must be
+	// guarded: a concurrent map write would otherwise crash the process.
+	mu     sync.Mutex
+	timers map[string]*time.Timer
+}
+
+func newPathDebouncer(duration time.Duration, fn func(string)) *pathDebouncer {
+	return &pathDebouncer{
+		duration: duration,
+		fn:       fn,
+		timers:   make(map[string]*time.Timer),
+	}
+}
+
+// trigger (re)starts the debounce timer for name; once it fires without being
+// reset, fn(name) is called and the timer is forgotten.
+func (d *pathDebouncer) trigger(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if timer, exists := d.timers[name]; exists {
+		timer.Reset(d.duration)
+		return
+	}
+	d.timers[name] = time.AfterFunc(d.duration, func() {
+		d.fn(name)
+		d.mu.Lock()
+		delete(d.timers, name)
+		d.mu.Unlock()
+	})
 }

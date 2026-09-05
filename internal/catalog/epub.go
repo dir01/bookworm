@@ -112,7 +112,7 @@ func readEPUBMetadata(zr *zip.Reader) (*BookMetadata, error) {
 }
 
 func epubOPFPath(zr *zip.Reader) (string, error) {
-	f := findZipEntry(zr, "META-INF/container.xml")
+	f := findZIPEntry(zr, "META-INF/container.xml")
 	if f == nil {
 		return "", fmt.Errorf("epub: missing META-INF/container.xml")
 	}
@@ -133,7 +133,7 @@ func epubOPFPath(zr *zip.Reader) (string, error) {
 }
 
 func parseOPF(zr *zip.Reader, opfPath string) (*opfPackage, error) {
-	f := findZipEntry(zr, opfPath)
+	f := findZIPEntry(zr, opfPath)
 	if f == nil {
 		return nil, fmt.Errorf("epub: opf %q not found", opfPath)
 	}
@@ -150,10 +150,10 @@ func parseOPF(zr *zip.Reader, opfPath string) (*opfPackage, error) {
 	return &pkg, nil
 }
 
-// findZipEntry returns the zip entry with the given name, matching
+// findZIPEntry returns the zip entry with the given name, matching
 // case-insensitively as a fallback (zip names are technically case-sensitive,
 // but "META-INF" casing varies in the wild).
-func findZipEntry(zr *zip.Reader, name string) *zip.File {
+func findZIPEntry(zr *zip.Reader, name string) *zip.File {
 	for _, f := range zr.File {
 		if f.Name == name {
 			return f

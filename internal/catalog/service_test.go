@@ -2,7 +2,9 @@ package catalog
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -28,7 +30,7 @@ func TestService(t *testing.T) {
 	tempDir, svc := mkSvc()
 
 	// region Test that files already present in the directory appeared in the index after .Scan()
-	createTestZipArchive(t, path.Join(tempDir, "books.zip"), "The Iliad - Homer - FB2.fb2")
+	createTestZIPArchive(t, path.Join(tempDir, "books.zip"), "The Iliad - Homer - FB2.fb2")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -51,7 +53,7 @@ func TestService(t *testing.T) {
 	// endregion
 
 	// region Test that files added after .Scan() appeared in the index as well (using fsnotify watcher)
-	createTestZipArchive(t, path.Join(tempDir, "books2.zip"), "On Dreams - Aristotle - FB2.fb2")
+	createTestZIPArchive(t, path.Join(tempDir, "books2.zip"), "On Dreams - Aristotle - FB2.fb2")
 
 	eventually(t, 5*time.Second, 100*time.Millisecond, func() (bool, error) {
 		if results, err := svc.Search(ctx, "Aristotle"); err != nil {
@@ -112,6 +114,107 @@ func TestService(t *testing.T) {
 	} // endregion
 }
 
+// TestServiceIndexesMixedZIP verifies a .zip archive is indexed by content, not
+// by a single hard-coded entry type: an .epub and an .fb2 sharing one archive
+// are both extracted. This is the "any leaf format in any container" contract.
+func TestServiceIndexesMixedZIP(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	tempDir := t.TempDir()
+
+	epubBytes := buildTestEPUB(t, testOPF) // "Pride and Prejudice", Jane Austen
+	fb2Bytes, err := os.ReadFile(filepath.Join("testdata", "The Iliad - Homer - FB2.fb2"))
+	if err != nil {
+		t.Fatalf("read fb2 fixture: %v", err)
+	}
+
+	writeZIP(t, filepath.Join(tempDir, "mixed.zip"), map[string][]byte{
+		"pride.epub": epubBytes,
+		"iliad.fb2":  fb2Bytes,
+	})
+
+	svc, err := NewService(tempDir, store)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := svc.Scan(ctx); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	// The EPUB entry is the new capability: previously indexZIP only looked at .fb2.
+	var epubBook *BookMetadata
+	eventually(t, 2*time.Second, 100*time.Millisecond, func() (bool, error) {
+		res, err := svc.Search(ctx, "Austen")
+		if err != nil {
+			return false, err
+		}
+		if len(res) == 1 {
+			epubBook = res[0]
+			return true, nil
+		}
+		return false, nil
+	})
+
+	if epubBook.FileType != ZIP {
+		t.Fatalf("FileType = %q, want %q", epubBook.FileType, ZIP)
+	}
+	if epubBook.SubFilepath != "pride.epub" {
+		t.Fatalf("SubFilepath = %q, want %q", epubBook.SubFilepath, "pride.epub")
+	}
+
+	// The .fb2 sharing the archive is still indexed too.
+	eventually(t, 2*time.Second, 100*time.Millisecond, func() (bool, error) {
+		res, err := svc.Search(ctx, "Homer")
+		if err != nil {
+			return false, err
+		}
+		return len(res) == 1, nil
+	})
+
+	// The epub is served back byte-for-byte (EPUB -> EPUB is a passthrough).
+	reader, cleanup, err := svc.GetBook(ctx, epubBook.ID, EPUB)
+	if err != nil {
+		t.Fatalf("GetBook: %v", err)
+	}
+	defer cleanup()
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read book: %v", err)
+	}
+	if !bytes.Equal(got, epubBytes) {
+		t.Fatalf("served epub differs from source (got %d bytes, want %d)", len(got), len(epubBytes))
+	}
+}
+
+func writeZIP(t *testing.T, path string, entries map[string][]byte) {
+	t.Helper()
+
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create zip %q: %v", path, err)
+	}
+	defer out.Close()
+
+	w := zip.NewWriter(out)
+	for name, content := range entries {
+		f, err := w.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %q: %v", name, err)
+		}
+		if _, err := f.Write(content); err != nil {
+			t.Fatalf("write zip entry %q: %v", name, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+}
+
 func eventually(t *testing.T, ttl time.Duration, tick time.Duration, f func() (bool, error)) {
 	t.Helper()
 
@@ -147,7 +250,7 @@ func copyTestFB2(t *testing.T, destDir string, files ...string) {
 	}
 }
 
-func createTestZipArchive(t *testing.T, path string, files ...string) {
+func createTestZIPArchive(t *testing.T, path string, files ...string) {
 	t.Helper()
 
 	for i, file := range files {

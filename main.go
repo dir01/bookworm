@@ -47,7 +47,7 @@ func main() {
 		telegramAuthorizedUsers = strings.Split(telegramAuthorizedUsersStr, ",")
 	}
 
-	store, err := catalog.NewSqliteStore(dbPath)
+	store, err := catalog.NewSQLiteStore(dbPath)
 	if err != nil {
 		log.Fatalf("[main] can't open store: %v", err)
 	}
