@@ -2,3 +2,5 @@
 .vscode
 bin/
 db/sqlite.db
+__pycache__/
+*.pyc

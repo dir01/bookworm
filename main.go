@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"github.com/jmoiron/sqlx"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +10,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/dir01/bookworm/internal/catalog"
+	"github.com/dir01/bookworm/internal/telegram"
+	"github.com/dir01/bookworm/internal/web"
 )
 
 func main() {
@@ -44,9 +47,12 @@ func main() {
 		telegramAuthorizedUsers = strings.Split(telegramAuthorizedUsersStr, ",")
 	}
 
-	db := sqlx.MustConnect("sqlite3", dbPath)
-	store := NewSqliteStore(db)
-	svc, err := NewService(booksDir, store)
+	store, err := catalog.NewSQLiteStore(dbPath)
+	if err != nil {
+		log.Fatalf("[main] can't open store: %v", err)
+	}
+
+	svc, err := catalog.NewService(booksDir, store)
 	if err != nil {
 		log.Fatalf("[main] can't create service: %v", err)
 	}
@@ -70,9 +76,9 @@ func main() {
 		}
 	}()
 
-	mux := NewHttpMux(svc)
+	mux := web.NewMux(svc)
 	httpServer := &http.Server{
-		Addr:    ":8080",
+		Addr:    bindAddr,
 		Handler: mux,
 	}
 
@@ -87,10 +93,10 @@ func main() {
 		}
 	}()
 
-	var bot *TelegramBot
+	var bot *telegram.Bot
 	if telegramToken != "" {
 		var err error
-		bot, err = NewTelegramBot(telegramToken, telegramAuthorizedUsers, svc)
+		bot, err = telegram.NewBot(telegramToken, telegramAuthorizedUsers, svc)
 		if err != nil {
 			log.Fatalf("[main] can't create telegram bot: %v", err)
 		}
@@ -112,5 +118,9 @@ func main() {
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("[main] can't shutdown server: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		log.Printf("[main] can't close store: %v", err)
 	}
 }

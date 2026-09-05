@@ -1,1 +1,0 @@
-Those public domain ebooks were downloaded from https://onemorelibrary.com/

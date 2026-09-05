@@ -7,6 +7,7 @@ package dsn
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"encoding"
 	"errors"
@@ -107,6 +108,7 @@ func (P CommonSimpleParams) String() string {
 	if P.LibDir != "" {
 		q.Add("libDir", P.LibDir)
 	}
+	s = ""
 	tz := P.Timezone
 	if tz != nil {
 		if tz == time.Local {
@@ -115,7 +117,9 @@ func (P CommonSimpleParams) String() string {
 			s = tz.String()
 		}
 	}
-	q.Add("timezone", s)
+	if s != "" {
+		q.Add("timezone", s)
+	}
 	if P.EnableEvents {
 		q.Add("enableEvents", "1")
 	}
@@ -149,10 +153,11 @@ func (P CommonSimpleParams) String() string {
 //
 // For details, see https://oracle.github.io/odpi/doc/structs/dpiConnCreateParams.html#dpiconncreateparams
 type ConnParams struct {
-	NewPassword                             Password
-	ConnClass                               string
-	ShardingKey, SuperShardingKey           []interface{}
-	IsSysDBA, IsSysOper, IsSysASM, IsPrelim bool
+	NewPassword                   Password
+	ConnClass                     string
+	ShardingKey, SuperShardingKey []any
+	AdminRole                     AdminRole
+	IsPrelim                      bool
 }
 
 // String returns the string representation of the ConnParams.
@@ -165,14 +170,8 @@ func (P ConnParams) String() string {
 	if !P.NewPassword.IsZero() {
 		q.Add("newPassword", P.NewPassword.String())
 	}
-	if P.IsSysDBA {
-		q.Add("sysdba", "1")
-	}
-	if P.IsSysOper {
-		q.Add("sysoper", "1")
-	}
-	if P.IsSysASM {
-		q.Add("sysasm", "1")
+	if P.AdminRole != "" {
+		q.Add("adminRole", P.AdminRole.String())
 	}
 	for _, v := range P.ShardingKey {
 		q.Add("shardingKey", fmt.Sprintf("%v", v))
@@ -201,7 +200,7 @@ type PoolParams struct {
 	MaxSessionsPerShard                        int
 	WaitTimeout, MaxLifeTime, SessionTimeout   time.Duration
 	PingInterval                               time.Duration
-	Heterogeneous, ExternalAuth                bool
+	Heterogeneous, ExternalAuth, NoWait        sql.NullBool
 }
 
 // String returns the string representation of PoolParams.
@@ -209,19 +208,30 @@ func (P PoolParams) String() string {
 	q := acquireParamsArray(8)
 	defer releaseParamsArray(q)
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
-	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	if P.MaxSessions != 0 {
+		q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	}
 	if P.MaxSessionsPerShard != 0 {
-		q.Add("poolMasSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
+		q.Add("poolMaxSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
 	}
 	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
-	if P.Heterogeneous {
-		q.Add("heterogeneousPool", "1")
+	if P.Heterogeneous.Valid {
+		q.Add("heterogeneousPool", b2s(P.Heterogeneous.Bool))
 	}
-	q.Add("poolWaitTimeout", P.WaitTimeout.String())
-	q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
-	q.Add("poolSessionTimeout", P.SessionTimeout.String())
-	if P.ExternalAuth {
-		q.Add("externalAuth", "1")
+	if P.WaitTimeout != 0 {
+		q.Add("poolWaitTimeout", P.WaitTimeout.String())
+	}
+	if P.MaxLifeTime != 0 {
+		q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
+	}
+	if P.SessionTimeout != 0 {
+		q.Add("poolSessionTimeout", P.SessionTimeout.String())
+	}
+	if P.ExternalAuth.Valid {
+		q.Add("externalAuth", b2s(P.ExternalAuth.Bool))
+	}
+	if P.NoWait.Valid {
+		q.Add("noWait", b2s(P.NoWait.Bool))
 	}
 	if P.PingInterval != 0 {
 		q.Add("pingInterval", P.PingInterval.String())
@@ -237,27 +247,35 @@ type ConnectionParams struct {
 	ConnParams
 	PoolParams
 	// ConnParams.NewPassword is used iff StandaloneConnection is true!
-	StandaloneConnection bool
+	StandaloneConnection sql.NullBool
 }
 
 // IsStandalone returns whether the connection should be standalone, not pooled.
 func (P ConnectionParams) IsStandalone() bool {
-	return P.StandaloneConnection || P.IsSysDBA || P.IsSysOper || P.IsSysASM || P.IsPrelim
+	return P.StandaloneConnection.Valid && P.StandaloneConnection.Bool ||
+		(!P.StandaloneConnection.Valid && DefaultStandaloneConnection) ||
+		P.ConnClass == NoConnectionPoolingConnectionClass ||
+		P.AdminRole != NoRole
 }
 
 func (P *ConnectionParams) comb() {
-	P.StandaloneConnection = P.StandaloneConnection || P.ConnClass == NoConnectionPoolingConnectionClass
-	if P.IsPrelim || P.StandaloneConnection {
+	if (!P.StandaloneConnection.Valid || !P.StandaloneConnection.Bool) &&
+		P.ConnClass == NoConnectionPoolingConnectionClass {
+		P.StandaloneConnection = Bool(true)
+	}
+	if P.IsPrelim || P.StandaloneConnection.Valid && P.StandaloneConnection.Bool {
 		// Prelim: the shared memory may not exist when Oracle is shut down.
 		P.ConnClass = ""
-		P.Heterogeneous = false
+		P.Heterogeneous = Bool(false)
 	}
 	if !P.IsStandalone() {
 		P.NewPassword.Reset()
 		// only enable external authentication if we are dealing with a
 		// homogeneous pool and no user name/password has been specified
-		if P.Username == "" && P.Password.IsZero() && !P.Heterogeneous {
-			P.ExternalAuth = true
+		if P.Username == "" && P.Password.IsZero() &&
+			!P.ExternalAuth.Valid &&
+			!(P.Heterogeneous.Valid && P.Heterogeneous.Bool) {
+			P.ExternalAuth = Bool(true)
 		}
 	}
 }
@@ -319,15 +337,15 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 			s = tz.String()
 		}
 	}
-	q.Add("timezone", s)
-	B := func(b bool) string {
-		if b {
-			return "1"
-		}
-		return "0"
+	if s != "" {
+		q.Add("timezone", s)
 	}
-	q.Add("noTimezoneCheck", B(P.NoTZCheck))
-	q.Add("perSessionTimezone", B(P.PerSessionTimezone))
+	if P.NoTZCheck {
+		q.Add("noTimezoneCheck", "1")
+	}
+	if P.PerSessionTimezone {
+		q.Add("perSessionTimezone", "1")
+	}
 	if P.StmtCacheSize != 0 {
 		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
 	}
@@ -335,25 +353,46 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 		q.Add("charset", P.Charset)
 	}
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
-	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	if P.MaxSessions != 0 {
+		q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	}
 	if P.MaxSessionsPerShard != 0 {
-		q.Add("poolMasSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
+		q.Add("poolMaxSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
 	}
 	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
-	q.Add("sysdba", B(P.IsSysDBA))
-	q.Add("sysoper", B(P.IsSysOper))
-	q.Add("sysasm", B(P.IsSysASM))
-	if P.StandaloneConnection {
-		q.Add("standaloneConnection", B(P.StandaloneConnection))
+	if P.AdminRole != "" {
+		q.Add("adminRole", P.AdminRole.String())
 	}
-	q.Add("enableEvents", B(P.EnableEvents))
-	q.Add("heterogeneousPool", B(P.Heterogeneous))
-	q.Add("externalAuth", B(P.ExternalAuth))
-	q.Add("prelim", B(P.IsPrelim))
-	q.Add("poolWaitTimeout", P.WaitTimeout.String())
-	q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
-	q.Add("poolSessionTimeout", P.SessionTimeout.String())
-	q.Add("pingInterval", P.PingInterval.String())
+	if P.StandaloneConnection.Valid {
+		q.Add("standaloneConnection", b2s(P.StandaloneConnection.Bool))
+	}
+	if P.EnableEvents {
+		q.Add("enableEvents", "1")
+	}
+	if P.Heterogeneous.Valid {
+		q.Add("heterogeneousPool", b2s(P.Heterogeneous.Bool))
+	}
+	if P.ExternalAuth.Valid {
+		q.Add("externalAuth", b2s(P.ExternalAuth.Bool))
+	}
+	if P.NoWait.Valid {
+		q.Add("noWait", b2s(P.NoWait.Bool))
+	}
+	if P.IsPrelim {
+		q.Add("prelim", "1")
+	}
+	if P.WaitTimeout != 0 {
+		q.Add("poolWaitTimeout", P.WaitTimeout.String())
+	}
+	if P.MaxLifeTime != 0 {
+		q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
+	}
+	if P.SessionTimeout != 0 {
+		q.Add("poolSessionTimeout", P.SessionTimeout.String())
+	}
+	if P.PingInterval != 0 {
+		q.Add("pingInterval", P.PingInterval.String())
+	}
 	as := acquireParamsArray(1)
 	defer releaseParamsArray(as)
 	for _, kv := range P.AlterSession {
@@ -361,11 +400,19 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 		as.Add(kv[0], kv[1])
 		q.Add("alterSession", strings.TrimSpace(as.String()))
 	}
-	q.Add("initOnNewConnection", B(P.InitOnNewConn))
-	q.Add("noBreakOnContextCancel", B(P.NoBreakOnContextCancel))
+	if P.InitOnNewConn {
+		q.Add("initOnNewConnection", "1")
+	}
+	if P.NoBreakOnContextCancel {
+		q.Add("noBreakOnContextCancel", "1")
+	}
 	q.Values["onInit"] = P.OnInitStmts
-	q.Add("configDir", P.ConfigDir)
-	q.Add("libDir", P.LibDir)
+	if P.ConfigDir != "" {
+		q.Add("configDir", P.ConfigDir)
+	}
+	if P.LibDir != "" {
+		q.Add("libDir", P.LibDir)
+	}
 	//return quoteRunes(P.Username, "/@") + "/" + quoteRunes(password, "@") + "@" + P.CommonParams.ConnectString + "\n" + q.String()
 
 	return q.String()
@@ -376,7 +423,7 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 // For examples, see [../doc/connection.md](../doc/connection.md)
 func Parse(dataSourceName string) (ConnectionParams, error) {
 	P := ConnectionParams{
-		StandaloneConnection: DefaultStandaloneConnection,
+		// StandaloneConnection: DefaultStandaloneConnection,
 		//CommonParams: CommonParams{ Timezone: time.Local, },
 		ConnParams: ConnParams{
 			ConnClass: DefaultConnectionClass,
@@ -435,12 +482,13 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		uSid := strings.ToUpper(dataSourceName)
 		//fmt.Printf("dataSourceName=%q SID=%q\n", dataSourceName, uSid)
 		if strings.Contains(uSid, " AS ") {
-			if P.IsSysDBA = strings.HasSuffix(uSid, " AS SYSDBA"); P.IsSysDBA {
-				dataSourceName = dataSourceName[:len(dataSourceName)-10]
-			} else if P.IsSysOper = strings.HasSuffix(uSid, " AS SYSOPER"); P.IsSysOper {
-				dataSourceName = dataSourceName[:len(dataSourceName)-11]
-			} else if P.IsSysASM = strings.HasSuffix(uSid, " AS SYSASM"); P.IsSysASM {
-				dataSourceName = dataSourceName[:len(dataSourceName)-10]
+			for _, role := range adminRoles {
+				s := role.String()
+				if dsn, ok := strings.CutSuffix(uSid, " AS "+s); ok {
+					P.AdminRole = role
+					dataSourceName = dataSourceName[:len(dsn)]
+					break
+				}
 			}
 		}
 		P.ConnectString = dataSourceName
@@ -490,25 +538,28 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 	if vv, ok := q["connectionClass"]; ok {
 		P.ConnClass = vv[0]
 	}
-	for _, task := range []struct {
+	var sysDBA, sysOper, sysASM bool
+	boolTasks := []struct {
 		Dest *bool
 		Key  string
 	}{
-		{&P.IsSysDBA, "sysdba"},
-		{&P.IsSysOper, "sysoper"},
-		{&P.IsSysASM, "sysasm"},
+		{&sysDBA, "sysdba"},
+		{&sysOper, "sysoper"},
+		{&sysASM, "sysasm"},
 		{&P.IsPrelim, "prelim"},
 
 		{&P.EnableEvents, "enableEvents"},
-		{&P.Heterogeneous, "heterogeneousPool"},
-		{&P.ExternalAuth, "externalAuth"},
-		{&P.StandaloneConnection, "standaloneConnection"},
 
 		{&P.NoTZCheck, "noTimezoneCheck"},
 		{&P.PerSessionTimezone, "perSessionTimezone"},
 		{&P.InitOnNewConn, "initOnNewConnection"},
 		{&P.NoBreakOnContextCancel, "noBreakOnContextCancel"},
-	} {
+	}
+	if ar := q.Get("adminRole"); len(ar) > 3 && strings.EqualFold(ar[:3], "SYS") {
+		P.AdminRole = AdminRole(strings.ToUpper(ar))
+		boolTasks = boolTasks[3:] // skip parsing
+	}
+	for _, task := range boolTasks {
 		s := q.Get(task.Key)
 		if s == "" {
 			continue
@@ -517,9 +568,38 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		if *task.Dest, err = strconv.ParseBool(s); err != nil {
 			return P, fmt.Errorf("%s=%q: %w", task.Key, s, err)
 		}
-		if task.Key == "heterogeneousPool" {
-			P.StandaloneConnection = !P.Heterogeneous
+	}
+	if P.AdminRole == "" {
+		if sysDBA {
+			P.AdminRole = SysDBA
+		} else if sysOper {
+			P.AdminRole = SysOPER
+		} else if sysASM {
+			P.AdminRole = SysASM
 		}
+	}
+
+	for _, task := range []struct {
+		Dest *sql.NullBool
+		Key  string
+	}{
+		{&P.Heterogeneous, "heterogeneousPool"},
+		{&P.ExternalAuth, "externalAuth"},
+		{&P.NoWait, "noWait"},
+		{&P.StandaloneConnection, "standaloneConnection"},
+	} {
+		s := q.Get(task.Key)
+		if s == "" {
+			continue
+		}
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return P, fmt.Errorf("%s=%q: %w", task.Key, s, err)
+		}
+		*task.Dest = Bool(b)
+	}
+	if !P.StandaloneConnection.Valid && P.Heterogeneous.Valid {
+		P.StandaloneConnection = Bool(!P.Heterogeneous.Bool)
 	}
 	// fmt.Println("parse", P.StringWithPassword())
 
@@ -553,9 +633,9 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 	}{
 		{&P.MinSessions, "poolMinSessions"},
 		{&P.MaxSessions, "poolMaxSessions"},
-		{&P.MaxSessionsPerShard, "poolMasSessionsPerShard"},
-		{&P.SessionIncrement, "poolIncrement"},
+		{&P.MaxSessionsPerShard, "poolMaxSessionsPerShard"},
 		{&P.SessionIncrement, "sessionIncrement"},
+		{&P.SessionIncrement, "poolIncrement"},
 		{&P.StmtCacheSize, "stmtCacheSize"},
 	} {
 		s := q.Get(task.Key)
@@ -740,26 +820,14 @@ func (p *paramsArray) WriteTo(w io.Writer) (int64, error) {
 	cw := &countingWriter{W: w}
 	enc := logfmt.NewEncoder(cw)
 	var firstErr error
-	var prev, act int64
 	for _, k := range append(firstKeys, keys...) {
 		for _, v := range p.Values[k] {
-			if act > 72 {
-				act = 0
-				if err := enc.EndRecord(); err != nil {
-					if firstErr == nil {
-						firstErr = err
-					}
-					break
-				}
-				prev = cw.N
-			}
 			if err := enc.EncodeKeyval(k, v); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
 				break
 			}
-			act = cw.N - prev
 		}
 	}
 	return cw.N, firstErr
@@ -925,7 +993,7 @@ func ParseTZ(s string) (int, error) {
 }
 
 // AppendLogfmt appends the key=val logfmt-formatted.
-func AppendLogfmt(w io.Writer, key, value interface{}) error {
+func AppendLogfmt(w io.Writer, key, value any) error {
 	e := logfmt.NewEncoder(w)
 	err := e.EncodeKeyval(key, value)
 	if endErr := e.EndRecord(); endErr != nil && err == nil {
@@ -934,12 +1002,12 @@ func AppendLogfmt(w io.Writer, key, value interface{}) error {
 	return err
 }
 
-func strToIntf(ss []string) []interface{} {
+func strToIntf(ss []string) []any {
 	n := len(ss)
 	if n == 0 {
 		return nil
 	}
-	intf := make([]interface{}, n)
+	intf := make([]any, n)
 	for i, s := range ss {
 		intf[i] = s
 	}
@@ -955,4 +1023,33 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	n, err := cw.W.Write(p)
 	cw.N += int64(n)
 	return n, err
+}
+
+func b2s(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+// Bool is an sql.NullBool helper
+func Bool(b bool) sql.NullBool { return sql.NullBool{Valid: true, Bool: b} }
+
+type AdminRole string
+
+func (r AdminRole) String() string { return string(r) }
+
+const (
+	NoRole    = AdminRole("")
+	SysDBA    = AdminRole("SYSDBA")
+	SysOPER   = AdminRole("SYSOPER")
+	SysBACKUP = AdminRole("SYSBACKUP")
+	SysDG     = AdminRole("SYSDG")
+	SysKM     = AdminRole("SYSKM")
+	SysRAC    = AdminRole("SYSRAC")
+	SysASM    = AdminRole("SYSASM")
+)
+
+var adminRoles = []AdminRole{
+	SysDBA, SysOPER, SysBACKUP, SysDG, SysKM, SysRAC, SysASM,
 }

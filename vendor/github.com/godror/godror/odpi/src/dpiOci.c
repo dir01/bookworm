@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2017, 2024, Oracle and/or its affiliates.
+// Copyright (c) 2017, 2026, Oracle and/or its affiliates.
 //
 // This software is dual-licensed to you under the Universal Permissive License
 // (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl and Apache License
@@ -24,7 +24,7 @@
 
 //-----------------------------------------------------------------------------
 // dpiOci.c
-//   Link to OCI using dynamic linking. The OCI library (11.2+) is loaded
+//   Link to OCI using dynamic linking. The OCI library (19.1+) is loaded
 // dynamically and a function table kept for the functions that are used by
 // DPI. This function table is populated as functions are used and permits use
 // of all versions of OCI from one driver.
@@ -43,13 +43,17 @@ typedef struct {
     size_t loadErrorLength;
     char *errorBuffer;
     size_t errorBufferLength;
+    char *envBuffer;
+    size_t envBufferLength;
+    char **configDir;
 } dpiOciLoadLibParams;
 
 
 // forward declarations of internal functions only used in this file
 static void *dpiOci__allocateMem(void *unused, size_t size);
 static void dpiOci__freeMem(void *unused, void *ptr);
-static int dpiOci__loadLibValidate(dpiVersionInfo *versionInfo,
+static int dpiOci__loadLibValidate(dpiContextCreateParams *params,
+        dpiOciLoadLibParams *loadParams, dpiVersionInfo *versionInfo,
         dpiError *error);
 static int dpiOci__loadLibWithDir(dpiOciLoadLibParams *loadParams,
         const char *dirName, size_t dirNameLength, int scanAllNames,
@@ -89,6 +93,11 @@ static void *dpiOci__reallocMem(void *unused, void *ptr, size_t newSize);
 
 
 // typedefs for all OCI functions used by ODPI-C
+typedef int (*dpiOciFnType__appCtxClearAll)(void *hndl, void *nsName,
+        uint32_t nsLength, void *errhp, uint32_t mode);
+typedef int (*dpiOciFnType__appCtxSet)(void *hndl, void *nsName,
+        uint32_t nsLength, void *attrName, uint32_t attrLength,
+        void *value, uint32_t valueLength, void *errhp, uint32_t mode);
 typedef int (*dpiOciFnType__aqDeq)(void *svchp, void *errhp,
         const char *queue_name, void *deqopt, void *msgprop, void *payload_tdo,
         void **payload, void **payload_ind, void **msgid, uint32_t flags);
@@ -489,8 +498,14 @@ typedef int (*dpiOciFnType__typeByName)(void *env, void *err, const void *svc,
         uint16_t pin_duration, int get_option, void **tdo);
 typedef int (*dpiOciFnType__vectorFromArray)(void *vectord, void *errhp,
         uint8_t vformat, uint32_t vdim, void *vecarray, uint32_t mode);
+typedef int (*dpiOciFnType__vectorFromSparseArray)(void *vectord, void *errhp,
+        uint8_t vformat, uint32_t vdim, uint32_t indices, void *indarray,
+        void *vecarray, uint32_t mode);
 typedef int (*dpiOciFnType__vectorToArray)(void *vectord, void *errhp,
         uint8_t vformat, uint32_t *vdim, void *vecarray, uint32_t mode);
+typedef int (*dpiOciFnType__vectorToSparseArray)(void *vectord, void *errhp,
+        uint8_t vformat, uint32_t *vdim, uint32_t *indices, void *indarray,
+        void *vecarray, uint32_t mode);
 
 
 // library handle for dynamically loaded OCI library
@@ -520,8 +535,13 @@ static const char *dpiOciLibNames[] = {
     NULL
 };
 
+// subdirectory for configuration directory
+static const char *dpiOciConfigSubDir = "network/admin";
+
 // all OCI symbols used by ODPI-C
 static struct {
+    dpiOciFnType__appCtxClearAll fnAppCtxClearAll;
+    dpiOciFnType__appCtxSet fnAppCtxSet;
     dpiOciFnType__aqDeq fnAqDeq;
     dpiOciFnType__aqDeqArray fnAqDeqArray;
     dpiOciFnType__aqEnq fnAqEnq;
@@ -684,7 +704,9 @@ static struct {
     dpiOciFnType__typeByFullName fnTypeByFullName;
     dpiOciFnType__typeByName fnTypeByName;
     dpiOciFnType__vectorFromArray fnVectorFromArray;
+    dpiOciFnType__vectorFromSparseArray fnVectorFromSparseArray;
     dpiOciFnType__vectorToArray fnVectorToArray;
+    dpiOciFnType__vectorToSparseArray fnVectorToSparseArray;
 } dpiOciSymbols;
 
 
@@ -700,6 +722,44 @@ static void *dpiOci__allocateMem(UNUSED void *unused, size_t size)
     ptr = malloc(size);
     dpiDebug__print("OCI allocated %u bytes at %p\n", size, ptr);
     return ptr;
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiOci__appCtxClearAll() [INTERNAL]
+//   Wrapper for OCIAppCtxClearAll().
+//-----------------------------------------------------------------------------
+int dpiOci__appCtxClearAll(dpiConn *conn, const char *namespaceName,
+        uint32_t namespaceNameLength, dpiError *error)
+{
+    int status;
+
+    DPI_OCI_LOAD_SYMBOL("OCIAppCtxClearAll", dpiOciSymbols.fnAppCtxClearAll)
+    DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    status = (*dpiOciSymbols.fnAppCtxClearAll)(conn->sessionHandle,
+            (void*) namespaceName, namespaceNameLength, error->handle,
+            DPI_OCI_DEFAULT);
+    DPI_OCI_CHECK_AND_RETURN(error, status, conn, "clear app context");
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiOci__appCtxSet() [INTERNAL]
+//   Wrapper for OCIAppCtxSet().
+//-----------------------------------------------------------------------------
+int dpiOci__appCtxSet(dpiConn *conn, dpiAppContext *appContext,
+        dpiError *error)
+{
+    int status;
+
+    DPI_OCI_LOAD_SYMBOL("OCIAppCtxSet", dpiOciSymbols.fnAppCtxSet)
+    DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    status = (*dpiOciSymbols.fnAppCtxSet)(conn->sessionHandle,
+            (void*) appContext->namespaceName, appContext->namespaceNameLength,
+            (void*) appContext->name, appContext->nameLength,
+            (void*) appContext->value, appContext->valueLength, error->handle,
+            DPI_OCI_DEFAULT);
+    DPI_OCI_CHECK_AND_RETURN(error, status, conn, "set app context");
 }
 
 
@@ -858,35 +918,6 @@ int dpiOci__attrSet(void *handle, uint32_t handleType, void *ptr,
 
 
 //-----------------------------------------------------------------------------
-// dpiOci__bindByName() [INTERNAL]
-//   Wrapper for OCIBindByName().
-//-----------------------------------------------------------------------------
-int dpiOci__bindByName(dpiStmt *stmt, void **bindHandle, const char *name,
-        int32_t nameLength, int dynamicBind, dpiVar *var, dpiError *error)
-{
-    uint32_t mode = DPI_OCI_DEFAULT;
-    int status;
-
-    if (dynamicBind)
-        mode |= DPI_OCI_DATA_AT_EXEC;
-    DPI_OCI_LOAD_SYMBOL("OCIBindByName", dpiOciSymbols.fnBindByName)
-    DPI_OCI_ENSURE_ERROR_HANDLE(error)
-    status = (*dpiOciSymbols.fnBindByName)(stmt->handle, bindHandle,
-            error->handle, name, nameLength,
-            (dynamicBind) ? NULL : var->buffer.data.asRaw,
-            (var->isDynamic) ? INT_MAX : (int32_t) var->sizeInBytes,
-            var->type->oracleType, (dynamicBind) ? NULL :
-                    var->buffer.indicator,
-            (dynamicBind || var->type->sizeInBytes) ? NULL :
-                    var->buffer.actualLength16,
-            (dynamicBind) ? NULL : var->buffer.returnCode,
-            (var->isArray) ? var->buffer.maxArraySize : 0,
-            (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
-    DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by name");
-}
-
-
-//-----------------------------------------------------------------------------
 // dpiOci__bindByName2() [INTERNAL]
 //   Wrapper for OCIBindByName2().
 //-----------------------------------------------------------------------------
@@ -907,39 +938,11 @@ int dpiOci__bindByName2(dpiStmt *stmt, void **bindHandle, const char *name,
             var->type->oracleType, (dynamicBind) ? NULL :
                     var->buffer.indicator,
             (dynamicBind || var->type->sizeInBytes) ? NULL :
-                    var->buffer.actualLength32,
+                    var->buffer.actualLength,
             (dynamicBind) ? NULL : var->buffer.returnCode,
             (var->isArray) ? var->buffer.maxArraySize : 0,
             (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
     DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by name");
-}
-
-
-//-----------------------------------------------------------------------------
-// dpiOci__bindByPos() [INTERNAL]
-//   Wrapper for OCIBindByPos().
-//-----------------------------------------------------------------------------
-int dpiOci__bindByPos(dpiStmt *stmt, void **bindHandle, uint32_t pos,
-        int dynamicBind, dpiVar *var, dpiError *error)
-{
-    uint32_t mode = DPI_OCI_DEFAULT;
-    int status;
-
-    if (dynamicBind)
-        mode |= DPI_OCI_DATA_AT_EXEC;
-    DPI_OCI_LOAD_SYMBOL("OCIBindByPos", dpiOciSymbols.fnBindByPos)
-    DPI_OCI_ENSURE_ERROR_HANDLE(error)
-    status = (*dpiOciSymbols.fnBindByPos)(stmt->handle, bindHandle,
-            error->handle, pos, (dynamicBind) ? NULL : var->buffer.data.asRaw,
-            (var->isDynamic) ? INT_MAX : (int32_t) var->sizeInBytes,
-            var->type->oracleType, (dynamicBind) ? NULL :
-                    var->buffer.indicator,
-            (dynamicBind || var->type->sizeInBytes) ? NULL :
-                    var->buffer.actualLength16,
-            (dynamicBind) ? NULL : var->buffer.returnCode,
-            (var->isArray) ? var->buffer.maxArraySize : 0,
-            (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
-    DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "bind by position");
 }
 
 
@@ -963,7 +966,7 @@ int dpiOci__bindByPos2(dpiStmt *stmt, void **bindHandle, uint32_t pos,
             var->type->oracleType, (dynamicBind) ? NULL :
                     var->buffer.indicator,
             (dynamicBind || var->type->sizeInBytes) ? NULL :
-                    var->buffer.actualLength32,
+                    var->buffer.actualLength,
             (dynamicBind) ? NULL : var->buffer.returnCode,
             (var->isArray) ? var->buffer.maxArraySize : 0,
             (var->isArray) ? &var->buffer.actualArraySize : NULL, mode);
@@ -1303,30 +1306,6 @@ int dpiOci__dbStartup(dpiConn *conn, void *adminHandle, uint32_t mode,
 
 
 //-----------------------------------------------------------------------------
-// dpiOci__defineByPos() [INTERNAL]
-//   Wrapper for OCIDefineByPos().
-//-----------------------------------------------------------------------------
-int dpiOci__defineByPos(dpiStmt *stmt, void **defineHandle, uint32_t pos,
-        dpiVar *var, dpiError *error)
-{
-    int status;
-
-    DPI_OCI_LOAD_SYMBOL("OCIDefineByPos", dpiOciSymbols.fnDefineByPos)
-    DPI_OCI_ENSURE_ERROR_HANDLE(error)
-    status = (*dpiOciSymbols.fnDefineByPos)(stmt->handle, defineHandle,
-            error->handle, pos, (var->isDynamic) ? NULL :
-                    var->buffer.data.asRaw,
-            (var->isDynamic) ? INT_MAX : (int32_t) var->sizeInBytes,
-            var->type->oracleType, (var->isDynamic) ? NULL :
-                    var->buffer.indicator,
-            (var->isDynamic) ? NULL : var->buffer.actualLength16,
-            (var->isDynamic) ? NULL : var->buffer.returnCode,
-            (var->isDynamic) ? DPI_OCI_DYNAMIC_FETCH : DPI_OCI_DEFAULT);
-    DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "define");
-}
-
-
-//-----------------------------------------------------------------------------
 // dpiOci__defineByPos2() [INTERNAL]
 //   Wrapper for OCIDefineByPos2().
 //-----------------------------------------------------------------------------
@@ -1343,7 +1322,7 @@ int dpiOci__defineByPos2(dpiStmt *stmt, void **defineHandle, uint32_t pos,
             (var->isDynamic) ? INT_MAX : var->sizeInBytes,
             var->type->oracleType, (var->isDynamic) ? NULL :
                     var->buffer.indicator,
-            (var->isDynamic) ? NULL : var->buffer.actualLength32,
+            (var->isDynamic) ? NULL : var->buffer.actualLength,
             (var->isDynamic) ? NULL : var->buffer.returnCode,
             (var->isDynamic) ? DPI_OCI_DYNAMIC_FETCH : DPI_OCI_DEFAULT);
     DPI_OCI_CHECK_AND_RETURN(error, status, stmt->conn, "define");
@@ -1728,6 +1707,92 @@ static int dpiOci__checkDllArchitecture(dpiOciLoadLibParams *loadParams,
 
 
 //-----------------------------------------------------------------------------
+// dpiOci__getEnv() [INTERNAL]
+//   Gets the value of the environment variable with the given name. If the
+// environment variable is not found, NULL is returned. On Windows, a buffer is
+// required.
+//-----------------------------------------------------------------------------
+static char *dpiOci__getEnv(dpiOciLoadLibParams *loadParams, const char *name)
+{
+    DWORD numBytes, actualNumBytes;
+
+    // call the first time to get the length; if the environment variable is
+    // not found, NULL is returned
+    numBytes = GetEnvironmentVariable(name, NULL, 0);
+    if (numBytes == 0)
+        return NULL;
+
+    // ensure the buffer is large enough to receive the contents
+    if (dpiUtils__ensureBuffer(numBytes + 1, "allocate environment variable",
+            (void**) &loadParams->envBuffer, &loadParams->envBufferLength,
+            NULL) < 0)
+        return NULL;
+
+    // call a second time to get the value
+    actualNumBytes = GetEnvironmentVariable(name, loadParams->envBuffer,
+            (DWORD) loadParams->envBufferLength);
+    if (actualNumBytes + 1 != numBytes)
+        return NULL;
+
+    return loadParams->envBuffer;
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiOci__getModuleDir() [INTERNAL]
+//   Attempts to get the directory of the module from the given function
+// pointer. This is platform specific.
+//-----------------------------------------------------------------------------
+static int dpiOci__getModuleDir(void *fn, const char *moduleType,
+        char **nameBuffer, size_t *nameBufferLength, dpiError *error)
+{
+    HMODULE module = NULL;
+    DWORD result = 0;
+    char *temp;
+
+    // attempt to get the module handle from a known function pointer
+    if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            (LPCSTR) fn, &module) == 0)
+        return DPI_FAILURE;
+
+    // attempt to get the module name from the module; the size of the buffer
+    // is increased as needed as there is no other known way to acquire the
+    // full name (MAX_PATH is no longer the maximum path length)
+    if (dpiUtils__ensureBuffer(MAX_PATH, "allocate module name",
+            (void**) nameBuffer, nameBufferLength, error) < 0) {
+        FreeLibrary(module);
+        return DPI_FAILURE;
+    }
+    while (1) {
+        result = GetModuleFileName(module, *nameBuffer,
+                (DWORD) *nameBufferLength);
+        if (result < (DWORD) *nameBufferLength)
+            break;
+        if (dpiUtils__ensureBuffer(*nameBufferLength * 2,
+                "allocate module name", (void**) nameBuffer, nameBufferLength,
+                error) < 0) {
+            FreeLibrary(module);
+            return DPI_FAILURE;
+        }
+    }
+    FreeLibrary(module);
+    if (result == 0)
+        return DPI_FAILURE;
+    if (dpiDebugLevel & DPI_DEBUG_LEVEL_LOAD_LIB)
+        dpiDebug__print("%s module name is %s\n", moduleType, *nameBuffer);
+
+    // strip off the module name and only return the directory name
+    temp = strrchr(*nameBuffer, '\\');
+    if (temp) {
+        *temp = '\0';
+        return DPI_SUCCESS;
+    }
+
+    return DPI_FAILURE;
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiOci__findAndCheckDllArchitecture() [INTERNAL]
 //   Attempt to find the specified DLL name using the standard search path and
 // if the DLL can be found but is of the wrong architecture, include the full
@@ -1767,7 +1832,7 @@ static int dpiOci__findAndCheckDllArchitecture(dpiOciLoadLibParams *loadParams,
             error);
 
     // search PATH
-    path = getenv("PATH");
+    path = dpiOci__getEnv(loadParams, "PATH");
     if (path) {
         while (status < 0) {
             temp = strchr(path, ';');
@@ -1825,86 +1890,47 @@ static int dpiOci__loadLibWithName(dpiOciLoadLibParams *loadParams,
 }
 
 
-//-----------------------------------------------------------------------------
-// dpiOci__loadLibInModuleDir() [INTERNAL]
-//   Attempts to load the library from the directory in which the ODPI-C module
-// (or its containing module) is located. This is platform specific.
-//-----------------------------------------------------------------------------
-static int dpiOci__loadLibInModuleDir(dpiOciLoadLibParams *loadParams,
-        dpiError *error)
-{
-    HMODULE module = NULL;
-    DWORD result = 0;
-    char *temp;
-
-    // attempt to get the module handle from a known function pointer
-    if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            (LPCSTR) dpiContext_createWithParams, &module) == 0)
-        return DPI_FAILURE;
-
-    // attempt to get the module name from the module; the size of the buffer
-    // is increased as needed as there is no other known way to acquire the
-    // full name (MAX_PATH is no longer the maximum path length)
-    if (dpiUtils__ensureBuffer(MAX_PATH, "allocate module name",
-            (void**) &loadParams->moduleNameBuffer,
-            &loadParams->moduleNameBufferLength, error) < 0) {
-        FreeLibrary(module);
-        return DPI_FAILURE;
-    }
-    while (1) {
-        result = GetModuleFileName(module, loadParams->moduleNameBuffer,
-                loadParams->moduleNameBufferLength);
-        if (result < (DWORD) loadParams->moduleNameBufferLength)
-            break;
-        if (dpiUtils__ensureBuffer(loadParams->moduleNameBufferLength * 2,
-                "allocate module name", (void**) &loadParams->moduleNameBuffer,
-                &loadParams->moduleNameBufferLength, error) < 0) {
-            FreeLibrary(module);
-            return DPI_FAILURE;
-        }
-    }
-    FreeLibrary(module);
-    if (result == 0)
-        return DPI_FAILURE;
-    if (dpiDebugLevel & DPI_DEBUG_LEVEL_LOAD_LIB)
-        dpiDebug__print("module name is %s\n", loadParams->moduleNameBuffer);
-
-    // use the module name to determine the directory and attempt to load the
-    // Oracle client libraries from there
-    temp = strrchr(loadParams->moduleNameBuffer, '\\');
-    if (temp) {
-        *temp = '\0';
-        return dpiOci__loadLibWithDir(loadParams, loadParams->moduleNameBuffer,
-                strlen(loadParams->moduleNameBuffer), 0, error);
-    }
-
-    return DPI_FAILURE;
-}
-
-
 // for platforms other than Windows
 #else
 
+//-----------------------------------------------------------------------------
+// dpiOci__getEnv() [INTERNAL]
+//   Gets the value of the environment variable with the given name. If the
+// environment variable is not found, NULL is returned.
+//-----------------------------------------------------------------------------
+static char *dpiOci__getEnv(UNUSED dpiOciLoadLibParams *loadParams,
+        const char *name)
+{
+    return getenv(name);
+}
+
 
 //-----------------------------------------------------------------------------
-// dpiOci__loadLibInModuleDir() [INTERNAL]
-//   Attempts to load the library from the directory in which the ODPI-C module
-// (or its containing module) is located. This is platform specific.
+// dpiOci__getModuleDir() [INTERNAL]
+//   Attempts to get the directory of the module from the given function
+// pointer. This is platform specific.
 //-----------------------------------------------------------------------------
-static int dpiOci__loadLibInModuleDir(dpiOciLoadLibParams *loadParams,
-        dpiError *error)
+static int dpiOci__getModuleDir(void *fn, const char *moduleType,
+        char **nameBuffer, size_t *nameBufferLength, dpiError *error)
 {
 #ifndef _AIX
-    char *dirName;
     Dl_info info;
+    char *temp;
 
-    if (dladdr(dpiContext_createWithParams, &info) != 0) {
+    if (dladdr(fn, &info) != 0) {
         if (dpiDebugLevel & DPI_DEBUG_LEVEL_LOAD_LIB)
-            dpiDebug__print("module name is %s\n", info.dli_fname);
-        dirName = strrchr(info.dli_fname, '/');
-        if (dirName)
-            return dpiOci__loadLibWithDir(loadParams, info.dli_fname,
-                    (size_t) (dirName - info.dli_fname), 0, error);
+            dpiDebug__print("%s module name is %s\n", moduleType,
+                    info.dli_fname);
+        if (dpiUtils__ensureBuffer(strlen(info.dli_fname) + 1,
+                "allocate module name", (void**) nameBuffer,
+                nameBufferLength, error) < 0)
+            return DPI_FAILURE;
+        strcpy(*nameBuffer, info.dli_fname);
+        temp = strrchr(*nameBuffer, '/');
+        if (temp) {
+            *temp = '\0';
+            return DPI_SUCCESS;
+        }
     }
 #endif
 
@@ -1952,7 +1978,7 @@ static int dpiOci__loadLibWithOracleHome(dpiOciLoadLibParams *loadParams,
     int status;
 
     // check environment variable; if not set, attempt cannot proceed
-    oracleHome = getenv("ORACLE_HOME");
+    oracleHome = dpiOci__getEnv(loadParams, "ORACLE_HOME");
     if (!oracleHome)
         return DPI_FAILURE;
 
@@ -1976,6 +2002,51 @@ static int dpiOci__loadLibWithOracleHome(dpiOciLoadLibParams *loadParams,
 }
 
 #endif
+
+//-----------------------------------------------------------------------------
+// dpiOci__calculateConfigDir() [INTERNAL]
+//   Attempt to calculate the default configuration directory to use when
+// locating configuration files. If the value cannot be calculated, no errors
+// are raised.
+//-----------------------------------------------------------------------------
+static void dpiOci__calculateConfigDir(dpiOciLoadLibParams *loadParams)
+{
+    size_t nameBufferLength = 0;
+    char *nameBuffer = NULL;
+    char *baseDir;
+    int status;
+
+    // first check to see if the environment variable TNS_ADMIN is set
+    baseDir = dpiOci__getEnv(loadParams, "TNS_ADMIN");
+    if (baseDir) {
+        status = dpiUtils__allocateMemory(1, strlen(baseDir) + 1, 0,
+                "allocate config dir", (void**) loadParams->configDir, NULL);
+        if (status == DPI_SUCCESS)
+            strcpy(*loadParams->configDir, baseDir);
+        return;
+    }
+
+    // otherwise, check the environment variable ORACLE_HOME is set and if not,
+    // look for the directory in which the Oracle Client library which has been
+    // loaded
+    baseDir = dpiOci__getEnv(loadParams, "ORACLE_HOME");
+    if (!baseDir) {
+        status = dpiOci__getModuleDir(dpiOciSymbols.fnThreadProcessInit,
+                "OCI", &nameBuffer, &nameBufferLength, NULL);
+        if (status == DPI_SUCCESS)
+            baseDir = nameBuffer;
+    }
+    if (baseDir) {
+        status = dpiUtils__allocateMemory(1,
+                strlen(baseDir) + strlen(dpiOciConfigSubDir) + 2, 0,
+                "allocate config dir", (void**) loadParams->configDir, NULL);
+        if (status == DPI_SUCCESS)
+            sprintf(*loadParams->configDir, "%s/%s", baseDir,
+                    dpiOciConfigSubDir);
+    }
+    if (nameBuffer)
+        dpiUtils__freeMemory(nameBuffer);
+}
 
 
 //-----------------------------------------------------------------------------
@@ -2057,7 +2128,7 @@ static int dpiOci__loadLibWithDir(dpiOciLoadLibParams *loadParams,
 //   Load the OCI library.
 //-----------------------------------------------------------------------------
 int dpiOci__loadLib(dpiContextCreateParams *params,
-        dpiVersionInfo *clientVersionInfo, dpiError *error)
+        dpiVersionInfo *clientVersionInfo, char **configDir, dpiError *error)
 {
     static const char *envNamesToCheck[] = {
         "ORACLE_HOME",
@@ -2077,6 +2148,13 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
     const char *temp;
     int status, i;
 
+    // initialize loading parameters; these are used to provide space for
+    // loading errors and the names that are being searched; memory is
+    // allocated dynamically in order to avoid potential issues with long paths
+    // on some platforms
+    memset(&loadLibParams, 0, sizeof(loadLibParams));
+    loadLibParams.configDir = configDir;
+
     // log the directory parameter values and any environment variables that
     // have an impact on loading the library
     if (dpiDebugLevel & DPI_DEBUG_LEVEL_LOAD_LIB) {
@@ -2093,7 +2171,7 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
         // now log environment variable values
         dpiDebug__print("Environment Variables:\n");
         for (i = 0; envNamesToCheck[i]; i++) {
-            temp = getenv(envNamesToCheck[i]);
+            temp = dpiOci__getEnv(&loadLibParams, envNamesToCheck[i]);
             if (temp)
                 dpiDebug__print("    %s => \"%s\"\n", envNamesToCheck[i],
                         temp);
@@ -2115,12 +2193,6 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
         }
     }
 
-    // initialize loading parameters; these are used to provide space for
-    // loading errors and the names that are being searched; memory is
-    // allocated dynamically in order to avoid potential issues with long paths
-    // on some platforms
-    memset(&loadLibParams, 0, sizeof(loadLibParams));
-
     // if a lib directory was specified in the create params, look for the OCI
     // library in that location only
     if (params->oracleClientLibDir) {
@@ -2135,8 +2207,14 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
 
         // first try the directory in which the ODPI-C library itself is found
         if (dpiDebugLevel & DPI_DEBUG_LEVEL_LOAD_LIB)
-            dpiDebug__print("check module directory\n");
-        status = dpiOci__loadLibInModuleDir(&loadLibParams, error);
+            dpiDebug__print("check ODPI-C module directory\n");
+        status = dpiOci__getModuleDir(dpiContext_createWithParams,
+                "ODPI-C", &loadLibParams.moduleNameBuffer,
+                &loadLibParams.moduleNameBufferLength, error);
+        if (status == DPI_SUCCESS)
+            status = dpiOci__loadLibWithDir(&loadLibParams,
+                    loadLibParams.moduleNameBuffer,
+                    strlen(loadLibParams.moduleNameBuffer), 0, error);
 
         // if that fails, try the default OS library loading mechanism
         if (status < 0) {
@@ -2165,6 +2243,13 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
                 bits, loadLibParams.loadError, params->loadErrorUrl);
     }
 
+    // validate library, if a library was loaded
+    if (status == DPI_SUCCESS) {
+        dpiOciLibHandle = loadLibParams.handle;
+        status = dpiOci__loadLibValidate(params, &loadLibParams,
+                clientVersionInfo, error);
+    }
+
     // free any memory that was allocated
     if (loadLibParams.nameBuffer)
         dpiUtils__freeMemory(loadLibParams.nameBuffer);
@@ -2174,23 +2259,27 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
         dpiUtils__freeMemory(loadLibParams.loadError);
     if (loadLibParams.errorBuffer)
         dpiUtils__freeMemory(loadLibParams.errorBuffer);
+    if (loadLibParams.envBuffer)
+        dpiUtils__freeMemory(loadLibParams.envBuffer);
 
-    // if no attempts, succeeded, return an error
-    if (status < 0)
-        return DPI_FAILURE;
-
-    // validate library
-    dpiOciLibHandle = loadLibParams.handle;
-    if (dpiOci__loadLibValidate(clientVersionInfo, error) < 0) {
+    // free the library, if a library was loaded and any error occurred
+    if (status < 0) {
+        if (dpiOciLibHandle != NULL) {
 #ifdef _WIN32
-        FreeLibrary(dpiOciLibHandle);
+            FreeLibrary(dpiOciLibHandle);
 #else
-        dlclose(dpiOciLibHandle);
+            dlclose(dpiOciLibHandle);
 #endif
-        dpiOciLibHandle = NULL;
+            dpiOciLibHandle = NULL;
+        }
         memset(&dpiOciSymbols, 0, sizeof(dpiOciSymbols));
         return DPI_FAILURE;
     }
+
+    // if no Oracle Client configuration directory was specified, set the
+    // value to contain the calculated value instead
+    if (!params->oracleClientConfigDir)
+        params->oracleClientConfigDir = *configDir;
 
     return DPI_SUCCESS;
 }
@@ -2200,7 +2289,8 @@ int dpiOci__loadLib(dpiContextCreateParams *params,
 // dpiOci__loadLibValidate() [INTERNAL]
 //   Validate the OCI library after loading.
 //-----------------------------------------------------------------------------
-static int dpiOci__loadLibValidate(dpiVersionInfo *clientVersionInfo,
+static int dpiOci__loadLibValidate(dpiContextCreateParams *params,
+        dpiOciLoadLibParams *loadParams, dpiVersionInfo *clientVersionInfo,
         dpiError *error)
 {
     if (dpiDebugLevel & DPI_DEBUG_LEVEL_LOAD_LIB)
@@ -2227,8 +2317,8 @@ static int dpiOci__loadLibValidate(dpiVersionInfo *clientVersionInfo,
                     clientVersionInfo->portReleaseNum,
                     clientVersionInfo->portUpdateNum);
 
-    // OCI version must be a minimum of 11.2
-    if (dpiUtils__checkClientVersion(clientVersionInfo, 11, 2, error) < 0)
+    // OCI version must be a minimum of 19.1
+    if (dpiUtils__checkClientVersion(clientVersionInfo, 19, 1, error) < 0)
         return DPI_FAILURE;
 
     // initialize threading capability in the OCI library
@@ -2243,6 +2333,10 @@ static int dpiOci__loadLibValidate(dpiVersionInfo *clientVersionInfo,
     DPI_OCI_LOAD_SYMBOL("OCIAttrGet", dpiOciSymbols.fnAttrGet)
     DPI_OCI_LOAD_SYMBOL("OCIAttrSet", dpiOciSymbols.fnAttrSet)
     DPI_OCI_LOAD_SYMBOL("OCIThreadKeyGet", dpiOciSymbols.fnThreadKeyGet)
+
+    // if a configuration directory is not supplied, calculate one, if possible
+    if (!params->oracleClientConfigDir)
+        dpiOci__calculateConfigDir(loadParams);
 
     return DPI_SUCCESS;
 }
@@ -3173,6 +3267,12 @@ int dpiOci__sessionGet(void *envHandle, void **handle, void *authInfo,
     status = (*dpiOciSymbols.fnSessionGet)(envHandle, error->handle, handle,
             authInfo, connectString, connectStringLength, tag, tagLength,
             outTag, outTagLength, found, mode);
+
+    // OCI might return a stale handle even though the call to OCISessionGet()
+    // failed; clear it to avoid unexpected errors being thrown, masking any
+    // true errors
+    if (status < 0)
+        *handle = NULL;
     DPI_OCI_CHECK_AND_RETURN(error, status, NULL, "get session");
 }
 
@@ -3884,13 +3984,17 @@ int dpiOci__stmtGetNextResult(dpiStmt *stmt, void **handle, dpiError *error)
 int dpiOci__stmtPrepare2(dpiStmt *stmt, const char *sql, uint32_t sqlLength,
         const char *tag, uint32_t tagLength, dpiError *error)
 {
+    uint32_t mode = DPI_OCI_DEFAULT;
     int status;
 
     DPI_OCI_LOAD_SYMBOL("OCIStmtPrepare2", dpiOciSymbols.fnStmtPrepare2)
     DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    if (dpiUtils__checkClientVersion(stmt->env->versionInfo, 12, 2,
+            NULL) == DPI_SUCCESS)
+        mode |= DPI_OCI_PREP2_GET_SQL_ID;
     status = (*dpiOciSymbols.fnStmtPrepare2)(stmt->conn->handle, &stmt->handle,
             error->handle, sql, sqlLength, tag, tagLength, DPI_OCI_NTV_SYNTAX,
-            DPI_OCI_DEFAULT);
+            mode);
     if (DPI_OCI_ERROR_OCCURRED(status)) {
         stmt->handle = NULL;
         return dpiError__setFromOCI(error, status, stmt->conn, "prepare SQL");
@@ -4371,6 +4475,29 @@ int dpiOci__vectorFromArray(dpiVector *vector, dpiVectorInfo *info,
 
 
 //-----------------------------------------------------------------------------
+// dpiOci__vectorFromSparseArray() [INTERNAL]
+//   Wrapper for OCIVectorFromSparseArray().
+//-----------------------------------------------------------------------------
+int dpiOci__vectorFromSparseArray(dpiVector *vector, dpiVectorInfo *info,
+        dpiError *error)
+{
+    int status;
+
+    if (dpiUtils__checkClientVersion(vector->env->versionInfo, 23, 7,
+            error) < 0)
+        return DPI_FAILURE;
+    DPI_OCI_LOAD_SYMBOL("OCIVectorFromSparseArray",
+            dpiOciSymbols.fnVectorFromSparseArray)
+    DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    status = (*dpiOciSymbols.fnVectorFromSparseArray)(vector->handle,
+            error->handle, info->format, info->numDimensions,
+            info->numSparseValues, info->sparseIndices, info->dimensions.asPtr,
+            DPI_OCI_DEFAULT);
+    DPI_OCI_CHECK_AND_RETURN(error, status, vector->conn, "vector from array");
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiOci__vectorToArray() [INTERNAL]
 //   Wrapper for OCIVectorToArray().
 //-----------------------------------------------------------------------------
@@ -4384,4 +4511,28 @@ int dpiOci__vectorToArray(dpiVector *vector, dpiError *error)
             vector->format, &vector->numDimensions, vector->dimensions,
             DPI_OCI_DEFAULT);
     DPI_OCI_CHECK_AND_RETURN(error, status, vector->conn, "vector to array");
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiOci__vectorToSparseArray() [INTERNAL]
+//   Wrapper for OCIVectorToSparseArray().
+//-----------------------------------------------------------------------------
+int dpiOci__vectorToSparseArray(dpiVector *vector, dpiError *error)
+{
+    uint32_t numDimensions = vector->numDimensions;
+    int status;
+
+    if (dpiUtils__checkClientVersion(vector->env->versionInfo, 23, 7,
+            error) < 0)
+        return DPI_FAILURE;
+    DPI_OCI_LOAD_SYMBOL("OCIVectorToSparseArray",
+            dpiOciSymbols.fnVectorToSparseArray)
+    DPI_OCI_ENSURE_ERROR_HANDLE(error)
+    status = (*dpiOciSymbols.fnVectorToSparseArray)(vector->handle,
+            error->handle, vector->format, &numDimensions,
+            &vector->numSparseValues, vector->sparseIndices,
+            vector->dimensions, DPI_OCI_DEFAULT);
+    DPI_OCI_CHECK_AND_RETURN(error, status, vector->conn,
+            "vector to sparse array");
 }

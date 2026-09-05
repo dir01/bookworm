@@ -8,12 +8,11 @@
 // The connection string for the sql.Open("godror", dataSourceName) call can be
 // the simple
 //
-//	user="login" password="password" connectString="host:port/service_name" sysdba=true
+//	user="login" password="password" connectString="host:port/service_name" adminRole=SYSDBA
 //
 // with additional params (here with the defaults):
 //
-//	sysdba=0
-//	sysoper=0
+//	adminRole=
 //	poolMinSessions=1
 //	poolMaxSessions=1000
 //	poolMaxSessionsPerShard=
@@ -69,7 +68,7 @@
 package godror
 
 /*
-#cgo CFLAGS: -I./odpi/include -I./odpi/src -I./odpi/embed
+#cgo CFLAGS: -I${SRCDIR}/odpi/include -I${SRCDIR}/odpi/src -I${SRCDIR}/odpi/embed
 
 #include "dpi.c"
 
@@ -107,15 +106,6 @@ const (
 	// DefaultArraySize is the length of the maximum PL/SQL array by default (if not changed through ArraySize statement option).
 	DefaultArraySize = 1 << 10
 
-	baseWaitTimeout = 30 * time.Second
-)
-
-// DriverName is set on the connection to be seen in the DB
-//
-// It cannot be longer than 30 bytes !
-var DriverName = "godror : " + Version
-
-const (
 	// DpiMajorVersion is the wanted major version of the underlying ODPI-C library.
 	DpiMajorVersion = C.DPI_MAJOR_VERSION
 	// DpiMinorVersion is the wanted minor version of the underlying ODPI-C library.
@@ -146,6 +136,23 @@ const (
 	DefaultMaxLifeTime = dsn.DefaultMaxLifeTime
 	//DefaultStandaloneConnection holds the default for standaloneConnection.
 	DefaultStandaloneConnection = dsn.DefaultStandaloneConnection
+
+	SysDBA    = dsn.SysDBA
+	SysOPER   = dsn.SysOPER
+	SysBACKUP = dsn.SysBACKUP
+	SysDG     = dsn.SysDG
+	SysKM     = dsn.SysKM
+	SysRAC    = dsn.SysRAC
+	SysASM    = dsn.SysASM
+
+	baseWaitTimeout = 30 * time.Second
+)
+
+// DriverName is set on the connection to be seen in the DB
+//
+// It cannot be longer than 30 bytes !
+var (
+	DriverName = "godror : " + Version
 )
 
 // dsn is separated out for fuzzing, but keep it as "internal"
@@ -164,6 +171,9 @@ func ParseConnString(s string) (ConnectionParams, error) { return dsn.Parse(s) }
 func ParseDSN(dataSourceName string) (P ConnectionParams, err error) {
 	return dsn.Parse(dataSourceName)
 }
+
+// Bool is a helper for sql.NullBool
+func Bool(b bool) sql.NullBool { return dsn.Bool(b) }
 
 func NewPassword(s string) Password { return dsn.NewPassword(s) }
 
@@ -470,7 +480,7 @@ func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, bool, er
 		if cleanup != nil {
 			cleanup()
 		}
-		return nil, false, err
+		return nil, false, fmt.Errorf("init: %w", err)
 	}
 
 	if !guardWithFinalizers.Load() {
@@ -483,7 +493,11 @@ func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, bool, er
 				cleanup()
 			}
 			if c != nil && c.dpiConn != nil {
-				fmt.Printf("ERROR: conn %p of createConn is not Closed!\n", c)
+				if logger := getLogger(context.Background()); logger != nil {
+					logger.Error("conn of createConn is not Closed!", "conn", fmt.Sprintf("%p", c))
+				} else {
+					fmt.Printf("ERROR: conn %p of createConn is not Closed!\n", c)
+				}
 				_ = c.closeNotLocking()
 			}
 		})
@@ -495,7 +509,11 @@ func (d *drv) createConn(pool *connPool, P commonAndConnParams) (*conn, bool, er
 				cleanup()
 			}
 			if c != nil && c.dpiConn != nil {
-				fmt.Printf("ERROR: conn %p of createConn is not Closed!\n%s\n", c, stack)
+				if logger := getLogger(context.Background()); logger != nil {
+					logger.Error("conn of createConn is not Closed!", "conn", fmt.Sprintf("%p", c), "stack", string(stack))
+				} else {
+					fmt.Printf("ERROR: conn %p of createConn is not Closed!\n%s\n", c, stack)
+				}
 				_ = c.closeNotLocking()
 			}
 		})
@@ -581,14 +599,21 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 
 	// assign authorization mode
 	connCreateParams.authMode = C.dpiAuthMode(C.DPI_MODE_AUTH_DEFAULT)
-	if P.IsSysDBA {
+	switch P.AdminRole {
+	case dsn.SysDBA:
 		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSDBA
-	}
-	if P.IsSysOper {
+	case dsn.SysOPER:
 		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSOPER
-	}
-	if P.IsSysASM {
+	case dsn.SysBACKUP:
+		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSBKP
+	case dsn.SysDG:
+		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSDGD
+	case dsn.SysKM:
+		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSKMT
+	case dsn.SysASM:
 		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSASM
+	case dsn.SysRAC:
+		connCreateParams.authMode |= C.DPI_MODE_AUTH_SYSRAC
 	}
 	if P.IsPrelim {
 		connCreateParams.authMode |= C.DPI_MODE_AUTH_PRELIM
@@ -647,7 +672,9 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 
 	// setup credentials
 	username, password := P.Username, P.Password.Secret()
-	if pool != nil && !pool.params.Heterogeneous && !pool.params.ExternalAuth {
+	if pool != nil &&
+		!(pool.params.Heterogeneous.Valid && pool.params.Heterogeneous.Bool) &&
+		!(pool.params.ExternalAuth.Valid && pool.params.ExternalAuth.Bool) {
 		// Only for homogeneous pool force user, password as empty.
 		username, password = "", ""
 	}
@@ -664,6 +691,18 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 	// create ODPI-C connection
 	var dc *C.dpiConn
 	if err := d.checkExec(func() C.int {
+		if logger != nil {
+			logger.Debug("dpiConn_create",
+				slog.String("dpiContext", fmt.Sprintf("%#v", d.dpiContext)),
+				slog.String("username", username), slog.Int("usernameLen", len(username)),
+				slog.String("password", password), slog.Int("passwordLen", len(password)),
+				slog.String("connectString", P.ConnectString), slog.Int("connectStringLen", len(P.ConnectString)),
+				slog.String("commonCreateParams", fmt.Sprintf("%#v", commonCreateParamsPtr)),
+				slog.String("connCreateParams", fmt.Sprintf("%#v", connCreateParams)),
+				slog.String("dpiConn", fmt.Sprintf("%#v", dc)),
+				slog.String("pool", fmt.Sprintf("%#v", pool)),
+			)
+		}
 		// fmt.Printf("dpiConn_create(dpiContext=%#v, username=%q[%d], password=%q[%d], connectString=%q[%d], commonCreateParams=%#v, connCreateParams=%#v, dpiConn=%#v) pool=%#v\n", d.dpiContext, username, C.uint32_t(len(username)), password, C.uint32_t(len(password)), P.ConnectString, C.uint32_t(len(P.ConnectString)), commonCreateParamsPtr, connCreateParams, dc, pool)
 		return C.dpiConn_create(
 			d.dpiContext,
@@ -678,6 +717,12 @@ func (d *drv) acquireConn(pool *connPool, P commonAndConnParams) (*C.dpiConn, bo
 			cleanup()
 		}
 		if pool != nil {
+			if connCreateParams.numShardingKeyColumns != 0 {
+				var ec interface{ Code() int }
+				if errors.As(err, &ec) && ec.Code() == 24459 { //  https://github.com/godror/godror/issues/379#issuecomment-3107438057
+					return nil, false, nil, fmt.Errorf("sharding=%+v for pooled connection failed: %w", P.ShardingKey, err)
+				}
+			}
 			stats, _ := d.getPoolStats(pool)
 			return nil, false, nil, fmt.Errorf("pool=%p stats=%s params=%+v: %w",
 				pool.dpiPool, stats, connCreateParams, err)
@@ -725,7 +770,7 @@ func (d *drv) createConnFromParams(ctx context.Context, P dsn.ConnectionParams) 
 	cancel()
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("init: %w", err)
 	}
 	return conn, nil
 }
@@ -742,16 +787,17 @@ func (d *drv) getPool(P commonAndPoolParams) (*connPool, error) {
 
 	var usernameKey string
 	var passwordHash [sha256.Size]byte
-	if !P.Heterogeneous && !P.ExternalAuth {
+	if !(P.Heterogeneous.Valid && P.Heterogeneous.Bool) &&
+		!(P.ExternalAuth.Valid && P.ExternalAuth.Bool) {
 		// skip username being part of key in heterogeneous pools
 		usernameKey = P.Username
 		passwordHash = sha256.Sum256([]byte(P.Password.Secret())) // See issue #245
 	}
 	// determine key to use for pool
-	poolKey := fmt.Sprintf("%s\t%x\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%t\t%t\t%t\t%s\t%d\t%s",
+	poolKey := fmt.Sprintf("%s\t%x\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%t\t%t\t%t\t%t\t%s\t%d\t%s",
 		usernameKey, passwordHash[:4], P.ConnectString, P.MinSessions, P.MaxSessions,
 		P.SessionIncrement, P.WaitTimeout, P.MaxLifeTime, P.SessionTimeout,
-		P.Heterogeneous, P.EnableEvents, P.ExternalAuth,
+		P.Heterogeneous.Bool, P.EnableEvents, P.ExternalAuth.Bool, P.NoWait.Bool,
 		P.Timezone, P.MaxSessionsPerShard, P.PingInterval,
 	)
 	logger := P.Logger
@@ -837,6 +883,9 @@ func (d *drv) createPool(P commonAndPoolParams) (*connPool, error) {
 
 	// assign "get" mode (always used timed wait)
 	poolCreateParams.getMode = C.DPI_MODE_POOL_GET_TIMEDWAIT
+	if P.NoWait.Valid && P.NoWait.Bool {
+		poolCreateParams.getMode = C.DPI_MODE_POOL_GET_NOWAIT
+	}
 
 	// assign wait timeout (number of milliseconds to wait for a session to
 	// become available
@@ -859,11 +908,14 @@ func (d *drv) createPool(P commonAndPoolParams) (*connPool, error) {
 	}
 
 	// assign external authentication flag
-	poolCreateParams.externalAuth = C.int(b2i(P.ExternalAuth))
+	poolCreateParams.externalAuth = C.int(b2i(
+		P.ExternalAuth.Valid && P.ExternalAuth.Bool ||
+			!P.ExternalAuth.Valid && P.Username == ""))
 
 	// assign homogeneous pool flag; default is true so need to clear the flag
 	// if specifically reqeuested or if external authentication is desirable
-	if poolCreateParams.externalAuth == 1 || P.Heterogeneous {
+	if poolCreateParams.externalAuth == 1 ||
+		(P.Heterogeneous.Valid && P.Heterogeneous.Bool) {
 		if P.Token == "" {
 			// Reset homogeneous only for non-token Authentication
 			poolCreateParams.homogeneous = 0

@@ -1,4 +1,4 @@
-// Copyright 2019, 2023 The Godror Authors
+// Copyright 2019, 2026 The Godror Authors
 //
 //
 // SPDX-License-Identifier: UPL-1.0 OR Apache-2.0
@@ -15,7 +15,9 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -45,10 +47,18 @@ type Queue struct {
 	PayloadObjectType *ObjectType
 	conn              *conn
 	dpiQueue          *C.dpiQueue
-	name              string
-	props             []*C.dpiMsgProps
-	mu                sync.Mutex
-	connIsOwned       bool
+	name, tableName   string
+	sizeStmt          interface {
+		io.Closer
+		driver.StmtQueryContext
+	}
+	defDeqOpts                     DeqOptions
+	defEnqOpts                     EnqOptions
+	props                          []*C.dpiMsgProps
+	cleanup                        runtime.Cleanup
+	mu                             sync.Mutex
+	connIsOwned                    bool
+	deqOptsTainted, enqOptsTainted bool
 }
 
 type queueOption interface{ qOption() }
@@ -59,6 +69,15 @@ func WithDeqOptions(o DeqOptions) queueOption { return o }
 // WithEnqOptions returns a queueOption usable in NewQueue, applying the given EnqOptions.
 func WithEnqOptions(o EnqOptions) queueOption { return o }
 
+// WithQueueTable returns a queueOption usable in NewQueue, setting the queue table explicitly.
+func WithQueueTable(name string) queueOption { return queueTableName{name} }
+
+type queueTableName struct {
+	Name string
+}
+
+func (queueTableName) qOption() {}
+
 // NewQueue creates a new Queue.
 //
 // WARNING: the connection given to it must not be closed before the Queue is closed!
@@ -68,18 +87,75 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 	if err != nil {
 		return nil, err
 	}
-	// Check whether this is a pool or a single connection.
-	cx2, err := DriverConn(ctx, execer)
-	if err != nil {
-		cx.Close()
-		return nil, err
+	var execerIsPool bool
+	{
+		// Check whether this is a pool or a single connection.
+		cx2, err := DriverConn(ctx, execer)
+		if err != nil {
+			cx.Close()
+			return nil, err
+		}
+		//fmt.Printf("cx=%p cx2=%p\n", cx.(*conn).dpiConn, cx2.(*conn).dpiConn)
+		if cx.(*conn).dpiConn != cx2.(*conn).dpiConn {
+			execerIsPool = true
+			cx2.Close()
+		}
 	}
-	//fmt.Printf("cx=%p cx2=%p\n", cx.(*conn).dpiConn, cx2.(*conn).dpiConn)
-	owned := cx.(*conn).dpiConn != cx2.(*conn).dpiConn
-	if owned {
-		cx2.Close()
+	Q := Queue{conn: cx.(*conn), name: name, connIsOwned: execerIsPool}
+	enqOpts := DefaultEnqOptions
+	deqOpts := DefaultDeqOptions
+	for _, o := range options {
+		switch x := o.(type) {
+		case DeqOptions:
+			deqOpts = x
+		case EnqOptions:
+			enqOpts = x
+		case queueTableName:
+			Q.tableName = x.Name
+		}
 	}
-	Q := Queue{conn: cx.(*conn), name: name, connIsOwned: owned}
+
+	logger := getLogger(context.TODO())
+	if Q.tableName == "" {
+		if err := func() error {
+			const qry = `SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')||'.'||queue_table AS queue_table
+	  FROM user_queues
+	  WHERE name = :name
+	UNION SELECT owner||'.'||queue_table
+	  FROM all_queues
+	  WHERE owner = REGEXP_REPLACE(:name, '\..*$') AND
+	        name  = REGEXP_REPLACE(:name, '^.*\.')`
+			stmt, err := cx.PrepareContext(ctx, qry)
+			if err != nil {
+				return fmt.Errorf("prepare %s: %w", qry, err)
+			}
+			defer stmt.Close()
+			rows, err := stmt.(driver.StmtQueryContext).QueryContext(ctx,
+				[]driver.NamedValue{
+					{Ordinal: 1, Name: "name", Value: name},
+				})
+			if err != nil {
+				return fmt.Errorf("%s [%q]: %w", qry, name, err)
+			}
+			defer rows.Close()
+			dest := []driver.Value{nil}
+			if err := rows.Next(dest); err != nil {
+				return fmt.Errorf("next: %w", err)
+			}
+			Q.tableName, _ = dest[0].(string)
+			if err = rows.Next(dest); err != io.EOF {
+				return fmt.Errorf("next: wanted EOF, got %+v", err)
+			}
+			return nil
+		}(); err != nil {
+			if logger != nil {
+				logger.Error("Get queue table name", "name", name, "error", err)
+			}
+		}
+	}
+	if logger != nil {
+		logger.Debug("NewQueue", "name", name, "tableName", Q.tableName)
+	}
 
 	var payloadType *C.dpiObjectType
 	if payloadObjectTypeName != "" {
@@ -101,34 +177,32 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 
 	if guardWithFinalizers.Load() {
 		if !logLingeringResourceStack.Load() {
-			runtime.SetFinalizer(&Q, func(Q *Queue) {
+			Q.cleanup = runtime.AddCleanup(&Q, func(Q *Queue) {
 				if Q != nil && Q.dpiQueue != nil {
-					fmt.Printf("ERROR: queue %p of NewQueue is not Closed!\n", Q)
+					if logger := getLogger(context.Background()); logger != nil {
+						logger.Error("queue of NewQueue is not Closed!", "queue", fmt.Sprintf("%p", Q))
+					} else {
+						fmt.Printf("ERROR: queue %p of NewQueue is not Closed!\n", Q)
+					}
 					Q.Close()
 				}
-			})
+			}, &Q)
 		} else {
 			var a [4096]byte
 			stack := a[:runtime.Stack(a[:], false)]
 			runtime.SetFinalizer(&Q, func(Q *Queue) {
 				if Q != nil && Q.dpiQueue != nil {
-					fmt.Printf("ERROR: queue %p of NewQueue is not Closed!\n%s\n", Q, stack)
+					if logger := getLogger(context.Background()); logger != nil {
+						logger.Error("queue of NewQueue is not Closed!", "queue", fmt.Sprintf("%p", Q), "stack", string(stack))
+					} else {
+						fmt.Printf("ERROR: queue %p of NewQueue is not Closed!\n%s\n", Q, stack)
+					}
 					Q.Close()
 				}
 			})
 		}
 	}
 
-	enqOpts := DefaultEnqOptions
-	deqOpts := DefaultDeqOptions
-	for _, o := range options {
-		switch x := o.(type) {
-		case DeqOptions:
-			deqOpts = x
-		case EnqOptions:
-			enqOpts = x
-		}
-	}
 	if err = Q.SetEnqOptions(enqOpts); err != nil {
 		cx.Close()
 		Q.Close()
@@ -139,6 +213,8 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 		Q.Close()
 		return nil, err
 	}
+	Q.defEnqOpts = enqOpts
+	Q.defDeqOpts = deqOpts
 	return &Q, nil
 }
 
@@ -147,36 +223,49 @@ func (Q *Queue) Close() error {
 	if Q == nil {
 		return nil
 	}
-	c, q := Q.conn, Q.dpiQueue
-	Q.conn, Q.dpiQueue = nil, nil
+	c, q, ot, st := Q.conn, Q.dpiQueue, Q.PayloadObjectType, Q.sizeStmt
+	Q.conn, Q.dpiQueue, Q.PayloadObjectType, Q.sizeStmt = nil, nil, nil, nil
+	if st != nil {
+		st.Close()
+	}
 	if q == nil {
 		return nil
 	}
+	Q.cleanup.Stop()
 	if err := c.checkExec(func() C.int { return C.dpiQueue_release(q) }); err != nil {
 		return fmt.Errorf("release: %w", err)
 	}
-	if Q.PayloadObjectType != nil && Q.PayloadObjectType.dpiObjectType != nil {
-		Q.PayloadObjectType.Close()
-		Q.PayloadObjectType = nil
-	}
-	if c != nil && Q.connIsOwned {
-		c.Close()
+	if Q.connIsOwned {
+		if ot != nil && ot.dpiObjectType != nil {
+			ot.Close()
+		}
+		if c != nil {
+			c.Close()
+		}
 	}
 	return nil
 }
 
 // Purge the expired messages from the queue.
 func (Q *Queue) PurgeExpired(ctx context.Context) error {
-	return Q.execQ(ctx, `BEGIN 
-  FOR row IN (
-    SELECT sys_context('USERENV', 'CURRENT_SCHEMA')||'.'||queue_table AS queue_table 
-	  FROM user_queues
-	  WHERE name = :1
-  ) LOOP
-    dbms_aqadm.purge_queue_table(row.queue_table, 'qtview.msg_state = ''EXPIRED''', NULL);
-  END LOOP;
-END;`,
-	)
+	if Q.tableName == "" {
+		return nil
+	}
+	const qry = `BEGIN DBMS_AQADM.purge_queue_table(:1, 'qtview.msg_state = ''EXPIRED''', NULL); END;`
+
+	stmt, err := Q.conn.PrepareContext(ctx, qry)
+	if err != nil {
+		return fmt.Errorf("%s: %w", qry, err)
+	}
+	defer stmt.Close()
+	if _, err = stmt.(driver.StmtExecContext).
+		ExecContext(ctx, []driver.NamedValue{
+			{Ordinal: 1, Value: Q.tableName},
+		},
+		); err != nil {
+		return fmt.Errorf("%s [%q]: %w", qry, Q.name, err)
+	}
+	return nil
 }
 
 // Name of the queue.
@@ -207,11 +296,88 @@ func (Q *Queue) DeqOptions() (DeqOptions, error) {
 // Dequeues messages into the given slice.
 // Returns the number of messages filled in the given slice.
 func (Q *Queue) Dequeue(messages []Message) (int, error) {
+	return Q.DequeueWithOptions(messages, nil)
+}
+
+// DequeueWithOptions messages into the given slice using the given (the Queue-default if nil) options.
+// Returns the number of messages filled in the given slice.
+func (Q *Queue) DequeueWithOptions(messages []Message, opts *DeqOptions) (int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	if num := len(messages); Q.tableName != "" && num > 1 {
+		logger := getLogger(context.TODO())
+		if err := func() error {
+			// See https://github.com/godror/godror/issues/382
+			qry := `SELECT ''||COUNT(0) FROM ` + Q.tableName + ` WHERE state IN (0, 1)` // READY, WAITING
+			if Q.sizeStmt == nil {
+				if stmt, err := Q.conn.PrepareContext(context.Background(), qry); err != nil {
+					return fmt.Errorf("prepare %s: %w", qry, err)
+				} else {
+					Q.sizeStmt = struct {
+						driver.StmtQueryContext
+						io.Closer
+					}{stmt.(driver.StmtQueryContext), stmt}
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			rows, err := Q.sizeStmt.QueryContext(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("%s: %w", qry, err)
+			}
+			defer rows.Close()
+			dest := []driver.Value{nil}
+			if err = rows.Next(dest); err != nil {
+				return fmt.Errorf("next: %w", err)
+			}
+			s, _ := dest[0].(string)
+			if logger != nil {
+				logger.Debug("Dequeue", "name", Q.name, "size", s, "dest", dest[0])
+			}
+			if s == "" {
+				return fmt.Errorf("queue table size: %#v", dest[0])
+			} else if i, err := strconv.Atoi(s); err != nil {
+				return fmt.Errorf("parse %q as int: %w", s, err)
+			} else {
+				num = int(i)
+			}
+			if err = rows.Next(dest); err != io.EOF {
+				return fmt.Errorf("next wanted EOF, got %+v", err)
+			}
+			return nil
+		}(); err != nil {
+			if logger != nil {
+				logger.Error("check queue size", "error", err)
+			}
+		} else if 0 <= num && num < len(messages) {
+			if num == 0 {
+				num = 1 // call deqOne if there are no messages to prevent memory leak
+			}
+			if logger != nil {
+				logger.Info("Dequeue limit number of messages", "old", len(messages), "new", num)
+			}
+			messages = messages[:num]
+		}
+	}
+
 	Q.mu.Lock()
 	defer Q.mu.Unlock()
+	if opts != nil {
+		Q.deqOptsTainted = true
+	}
+	if Q.deqOptsTainted {
+		D := Q.defDeqOpts
+		if opts == nil {
+			Q.deqOptsTainted = false
+		} else {
+			D = *opts
+		}
+		if err := Q.SetDeqOptions(D); err != nil {
+			return 0, err
+		}
+	}
+
 	var props []*C.dpiMsgProps
 	if cap(Q.props) >= len(messages) {
 		props = Q.props[:len(messages)]
@@ -222,6 +388,7 @@ func (Q *Queue) Dequeue(messages []Message) (int, error) {
 
 	var num C.uint
 	deqOne := len(props) == 1
+
 	dequeue := func() C.int {
 		num = C.uint(len(props))
 		if deqOne {
@@ -299,11 +466,35 @@ func (Q *Queue) start() error {
 // Ensure that this function is not run in parallel, use standalone connections or connections from different pools, or make multiple calls to Queue.enqOne() instead.
 // The function Queue.Dequeue() call is not affected.
 func (Q *Queue) Enqueue(messages []Message) error {
+	return Q.EnqueueWithOptions(messages, nil)
+}
+
+// EnqueueWithOptions all the messages given, using the given options (the Queue-default if nil).
+//
+// WARNING: calling this function in parallel on different connections acquired from the same pool may fail due to Oracle bug 29928074.
+// Ensure that this function is not run in parallel, use standalone connections or connections from different pools, or make multiple calls to Queue.enqOne() instead.
+// The function Queue.Dequeue() call is not affected.
+func (Q *Queue) EnqueueWithOptions(messages []Message, opts *EnqOptions) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	Q.mu.Lock()
 	defer Q.mu.Unlock()
+	if opts != nil {
+		Q.enqOptsTainted = true
+	}
+	if Q.enqOptsTainted {
+		E := Q.defEnqOpts
+		if opts == nil {
+			Q.enqOptsTainted = false
+		} else {
+			E = *opts
+		}
+		if err := Q.SetEnqOptions(E); err != nil {
+			return err
+		}
+	}
+
 	var props []*C.dpiMsgProps
 	if cap(Q.props) >= len(messages) {
 		props = Q.props[:len(messages)]
